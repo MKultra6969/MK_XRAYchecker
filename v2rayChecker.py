@@ -46,7 +46,7 @@ from http.client import BadStatusLine, RemoteDisconnected
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from types import SimpleNamespace
-from threading import Lock
+from threading import Lock, Semaphore
 
 try:
     from art import text2art
@@ -162,11 +162,18 @@ DEFAULT_CONFIG = {
     "output_file": "sortedProxy.txt", # имя файла с отфильтрованными проксями
     "core_startup_timeout": 2.5, # Максимальное время ожидания старта ядра(ну если тупит)
     "core_kill_delay": 0.05,     # Задержка после УБИЙСТВА
-    "speed_test_url": "https://speed.cloudflare.com/__down?bytes=10000000", # ссылка для замеров
     "shuffle": False,
     "check_speed": False,
-    "sort_by": "ping", # ping | speed
-    "sources": {} # Переезд в отделный .json
+    "sort_by": "ping",           # ping | speed
+
+    "speed_check_threads": 3, 
+    "speed_test_url": "https://speed.cloudflare.com/__down?bytes=10000000", # Ссылка для скачивания
+    "speed_download_timeout": 10, # Макс. время (сек) на скачивание файла (Чем больше - Тем точнее замеры.)
+    "speed_connect_timeout": 5,   # Макс. время (сек) на подключение перед скачиванием (пинг 4000мс, скрипт ждёт 5000мс, значит скорость будет замеряна.)
+    "speed_max_mb": 10,           # Лимит скачивания в МБ (чтобы не тратить трафик)
+    "speed_min_kb": 1,            # Минимальный порог данных (в Килобайтах). Если прокси скачал меньше этого, скорость будет равной 0.0
+
+    "sources": {}, # Переезд в отделный .json
 }
 
 def load_sources():
@@ -897,7 +904,7 @@ def check_connection(local_port, domain, timeout):
     except Exception as e:
         return False, str(e)
     
-def check_speed_download(local_port, url_file, timeout=12):
+def check_speed_download(local_port, url_file, timeout=10, conn_timeout=5, max_mb=5, min_kb=1):
     proxies = {
         'http': f'socks5://127.0.0.1:{local_port}',
         'https': f'socks5://127.0.0.1:{local_port}'
@@ -906,34 +913,42 @@ def check_speed_download(local_port, url_file, timeout=12):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     try:
-        start_time = time.time()
-        with requests.get(url_file, proxies=proxies, headers=headers, stream=True, timeout=timeout, verify=False) as r:
+        with requests.get(url_file, proxies=proxies, headers=headers, stream=True, timeout=(conn_timeout, timeout), verify=False) as r:
             r.raise_for_status()
+            
+            start_time = time.time()
             total_bytes = 0
-            limit_bytes = 10 * 1024 * 1024
+            limit_bytes = max_mb * 1024 * 1024
             
-            for chunk in r.iter_content(chunk_size=16384):
-                if chunk:
-                    total_bytes += len(chunk)
-                if time.time() - start_time > timeout or total_bytes >= limit_bytes:
-                    break
-        
-        duration = time.time() - start_time
-        if duration <= 0: duration = 0.1
-        
-        if total_bytes < 10240:
-            return 0.0
+            try:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        total_bytes += len(chunk)
+                    
+                    if time.time() - start_time > timeout or total_bytes >= limit_bytes:
+                        break
+            except Exception:
+                pass
             
-        speed_bps = total_bytes / duration
-        speed_mbps = speed_bps / 125000 
-        
-        return round(speed_mbps, 2)
+            duration = time.time() - start_time
+            if duration <= 0.1: duration = 0.1
+            
+            if total_bytes < (min_kb * 1024):
+                return 0.0
+                
+            speed_bps = total_bytes / duration
+            speed_mbps = speed_bps / 125000 
+            
+            return round(speed_mbps, 2)
     except Exception:
         return 0.0
 
-def Checker(proxyList, localPort, testDomain, timeOut, t2exec, t2kill, checkSpeed=False, speedUrl="", sortBy="ping"):
+def Checker(proxyList, localPort, testDomain, timeOut, t2exec, t2kill, checkSpeed=False, speedUrl="", sortBy="ping", speedCfg=None, speedSemaphore=None):
     liveProxy = []
     
+    if speedCfg is None:
+        speedCfg = {"timeout": 10, "conn_timeout": 5, "max_mb": 5, "min_kb": 1}
+
     for url in proxyList:
         if CTRL_C: break
         
@@ -970,7 +985,25 @@ def Checker(proxyList, localPort, testDomain, timeOut, t2exec, t2kill, checkSpee
         if ping:
             if checkSpeed:
                 safe_print(f"[blue][TEST][/] Measuring speed for {tag[:15]}...")
-                speed = check_speed_download(localPort, speedUrl, timeout=10)
+                
+                if speedSemaphore:
+                    with speedSemaphore:
+                        speed = check_speed_download(
+                            localPort, speedUrl, 
+                            timeout=speedCfg['timeout'],
+                            conn_timeout=speedCfg['conn_timeout'],
+                            max_mb=speedCfg['max_mb'],
+                            min_kb=speedCfg['min_kb']
+                        )
+                else:
+                    speed = check_speed_download(
+                        localPort, speedUrl, 
+                        timeout=speedCfg['timeout'],
+                        conn_timeout=speedCfg['conn_timeout'],
+                        max_mb=speedCfg['max_mb'],
+                        min_kb=speedCfg['min_kb']
+                    )
+                
                 safe_print(f"[green][LIVE][/] {ping}ms | [bold cyan]{speed} Mbps[/] | {tag}")
             else:
                 safe_print(f"[green][LIVE][/] {ping}ms | {tag}")
@@ -1108,13 +1141,31 @@ def run_logic(args):
     with Progress(*progress_columns, console=console, transient=False) as progress:
         task_id = progress.add_task("[cyan]Checking proxies...", total=len(full))
         
+    speed_config_map = {
+        "timeout": GLOBAL_CFG.get("speed_download_timeout", 10),
+        "conn_timeout": GLOBAL_CFG.get("speed_connect_timeout", 5),
+        "max_mb": GLOBAL_CFG.get("speed_max_mb", 5),
+        "min_kb": GLOBAL_CFG.get("speed_min_kb", 1)
+    }
+    
+    max_speed_threads = GLOBAL_CFG.get("speed_check_threads", 3)
+    speed_semaphore = Semaphore(max_speed_threads)
+    
+    if args.speed_check:
+        safe_print(f"[magenta]>> Ограничение потоков спидтеста: {max_speed_threads}[/]")
+
+    with Progress(*progress_columns, console=console, transient=False) as progress:
+        task_id = progress.add_task("[cyan]Checking proxies...", total=len(full))
+        
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = []
             for i in range(threads):
                 if i < len(chunks) and chunks[i]:
                     futures.append(executor.submit(
                         Checker, chunks[i], ports[i], args.domain, args.timeout, 
-                        args.t2exec, args.t2kill, args.speed_check, args.speed_test_url, args.sort_by
+                        args.t2exec, args.t2kill, args.speed_check, args.speed_test_url, args.sort_by,
+                        speed_config_map,
+                        speed_semaphore
                     ))
             
             try:
