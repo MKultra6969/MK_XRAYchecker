@@ -19,7 +19,7 @@
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
 # +═════════════════════════════════════════════════════════════════════════+
-# ║                           VERSION 0.9.6 fixes                           ║
+# ║                           VERSION 1.0.0 batch check                     ║
 # ║             В случае багов/недочётов создайте issue на github           ║
 # ║                                                                         ║
 # +═════════════════════════════════════════════════════════════════════════+
@@ -156,6 +156,8 @@ DEFAULT_SOURCES_DATA = {
 DEFAULT_CONFIG = {
     "core_path": "xray",  # путь до ядра, просто xray если лежит в обнимку с скриптом
     "threads": 20,        # Потоки
+    "proxies_per_batch": 50, # Сколько проксей обрабатывает ОДНО ядро xray
+    "max_internal_threads": 50, # Сколько ПАРАЛЛЕЛЬНЫХ проверок идет внутри одного ядра
     "timeout": 3,         # Таймаут (повышать в случае огромного пинга)
     "local_port_start": 1080, # Отвечает за то, с какого конкретно порта будут запускаться ядра, 1080 > 1081 > 1082 = три потока(три ядра)
     "test_domain": "https://www.google.com/generate_204", # Ссылка по которой будут чекаться прокси, можно использовать другие в случае блокировок в разных странах.(http://cp.cloudflare.com/generate_204)
@@ -731,7 +733,8 @@ def get_proxy_tag(url):
     
     return "proxy"
 
-def create_config_file(proxy_url, local_port, work_dir):
+def get_outbound_structure(proxy_url, tag):
+    """Преобразует URL в структуру outbound для Xray JSON"""
     proxy_url = clean_url(proxy_url)
     proxy_conf = None
     
@@ -741,22 +744,14 @@ def create_config_file(proxy_url, local_port, work_dir):
     elif proxy_url.startswith("ss://"): proxy_conf = parse_ss(proxy_url)
     elif proxy_url.startswith("hy"): proxy_conf = parse_hysteria2(proxy_url)
     
-    if not proxy_conf: 
-        return None, "Parsing Failed"
-
-    if not proxy_conf.get("port") or not proxy_conf.get("address"):
-        return None, "Port or Address missing"
+    if not proxy_conf: return None
 
     streamSettings = {}
-
-    streamSettings = {}
-    
     if proxy_conf["protocol"] in ["vless", "vmess", "trojan"]:
         streamSettings = {
             "network": proxy_conf.get("type", "tcp"),
             "security": proxy_conf.get("security", "none")
         }
-        
         if streamSettings["security"] == "tls":
             streamSettings["tlsSettings"] = {
                 "serverName": proxy_conf.get("sni") or proxy_conf.get("host"),
@@ -764,118 +759,81 @@ def create_config_file(proxy_url, local_port, work_dir):
                 "fingerprint": proxy_conf.get("fp", "")
             }
         elif streamSettings["security"] == "reality":
-             if "xray" not in CORE_PATH.lower(): return None, "Reality requires Xray"
              streamSettings["realitySettings"] = {
                 "publicKey": proxy_conf.get("pbk"),
                 "shortId": proxy_conf.get("sid"),
                 "serverName": proxy_conf.get("sni"),
                 "fingerprint": proxy_conf.get("fp", "chrome")
             }
-
         if streamSettings["network"] == "ws":
             streamSettings["wsSettings"] = {
                 "path": proxy_conf.get("path", "/"),
                 "headers": {"Host": proxy_conf.get("host", "")}
             }
-            
         elif streamSettings["network"] == "grpc":
-            svc_name = proxy_conf.get("serviceName", "")
-            if not svc_name:
-                svc_name = proxy_conf.get("path", "")
-            if not svc_name:
-                svc_name = "grpc" # Заглушка, впринцепе ваще похуй че туда писать.
-            
             streamSettings["grpcSettings"] = {
-                "serviceName": svc_name,
+                "serviceName": proxy_conf.get("serviceName", "") or proxy_conf.get("path", "") or "grpc",
                 "multiMode": False
             }
 
-    if proxy_conf["protocol"] == "hysteria2":
-        streamSettings = {
-            "security": "tls",
-            "tlsSettings": {
-                "serverName": proxy_conf.get("sni", ""),
-                "allowInsecure": proxy_conf.get("insecure", False)
-            }
-        }
-
-    outbound = {
-        "protocol": proxy_conf["protocol"],
-        "streamSettings": streamSettings
-    }
+    outbound = {"protocol": proxy_conf["protocol"], "tag": tag, "streamSettings": streamSettings}
 
     if proxy_conf["protocol"] == "shadowsocks":
-        legacy_methods = ["chacha20-ietf", "chacha20", "rc4-md5", "aes-128-ctr", "aes-192-ctr", "aes-256-ctr", "aes-128-cfb", "aes-192-cfb", "aes-256-cfb"]
-        curr_method = proxy_conf["method"].lower()
-        if curr_method == "chacha20-ietf": curr_method = "chacha20-ietf-poly1305" 
-        
-        outbound["settings"] = {
-            "servers": [{
-                "address": proxy_conf["address"],
-                "port": int(proxy_conf["port"]),
-                "method": curr_method,
-                "password": proxy_conf["password"]
-            }]
-        }
+        method = proxy_conf["method"].lower()
+        if method == "chacha20-ietf": method = "chacha20-ietf-poly1305"
+        outbound["settings"] = {"servers": [{"address": proxy_conf["address"], "port": int(proxy_conf["port"]), "method": method, "password": proxy_conf["password"]}]}
         outbound.pop("streamSettings", None)
-
     elif proxy_conf["protocol"] == "trojan":
-        outbound["settings"] = {
-            "servers": [{
-                "address": proxy_conf["address"],
-                "port": int(proxy_conf["port"]),
-                "password": proxy_conf["uuid"]
-            }]
-        }
-        
+        outbound["settings"] = {"servers": [{"address": proxy_conf["address"], "port": int(proxy_conf["port"]), "password": proxy_conf["uuid"]}]}
     elif proxy_conf["protocol"] == "hysteria2":
-        hy2_settings = {
-            "address": proxy_conf["address"],
-            "port": int(proxy_conf["port"]),
-            "users": [{"password": proxy_conf["uuid"]}]
-        }
+        hy2_settings = {"address": proxy_conf["address"], "port": int(proxy_conf["port"]), "users": [{"password": proxy_conf["uuid"]}]}
         if proxy_conf.get("obfs") and proxy_conf.get("obfs") != "none":
-             hy2_settings["obfs"] = {
-                 "type": proxy_conf["obfs"],
-                 "password": proxy_conf.get("obfs_password", "")
-             }
-
-        outbound["settings"] = {
-            "vnext": [hy2_settings]
-        }
-
+             hy2_settings["obfs"] = {"type": proxy_conf["obfs"], "password": proxy_conf.get("obfs_password", "")}
+        outbound["settings"] = {"vnext": [hy2_settings]}
+        outbound["streamSettings"] = {"security": "tls", "tlsSettings": {"serverName": proxy_conf.get("sni", ""), "allowInsecure": proxy_conf.get("insecure", False)}}
     else:
-        outbound["settings"] = {
-            "vnext": [{
-                "address": proxy_conf["address"],
-                "port": int(proxy_conf["port"]),
-                "users": [{
-                    "id": proxy_conf["uuid"],
-                    "alterId": proxy_conf.get("aid", 0),
-                    "encryption": "none",
-                    "flow": proxy_conf.get("flow", "") 
-                }]
-            }]
-        }
+        outbound["settings"] = {"vnext": [{
+            "address": proxy_conf["address"], "port": int(proxy_conf["port"]),
+            "users": [{"id": proxy_conf["uuid"], "alterId": proxy_conf.get("aid", 0), "encryption": "none", "flow": proxy_conf.get("flow", "")}]
+        }]}
+    return outbound
+
+def create_batch_config_file(proxy_list, start_port, work_dir):
+    inbounds = []
+    outbounds = []
+    rules = []
+    
+    valid_proxies = []
+    for i, url in enumerate(proxy_list):
+        port = start_port + i
+        in_tag = f"in_{port}"
+        out_tag = f"out_{port}"
+        
+        out_struct = get_outbound_structure(url, out_tag)
+        if not out_struct: continue
+        
+        inbounds.append({
+            "port": port, "listen": "127.0.0.1", "protocol": "socks",
+            "tag": in_tag, "settings": {"udp": True}
+        })
+        outbounds.append(out_struct)
+        rules.append({"type": "field", "inboundTag": [in_tag], "outboundTag": out_tag})
+        valid_proxies.append((url, port))
+
+    if not outbounds: return None, None, "No valid proxies"
 
     full_config = {
-        "log": {"loglevel": "none"}, 
-        "inbounds": [{
-            "port": local_port,
-            "listen": "127.0.0.1",
-            "protocol": "socks",
-            "settings": {"udp": True}
-        }],
-        "outbounds": [outbound]
+        "log": {"loglevel": "none"},
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "routing": {"domainStrategy": "AsIs", "rules": rules}
     }
 
-    filename = os.path.join(work_dir, f"config_{local_port}.json")
-    try:
-        with open(filename, 'w') as f:
-            json.dump(full_config, f, indent=2)
-    except Exception as e:
-        return None, str(e)
-    return filename, None
+    config_path = os.path.join(work_dir, f"batch_{start_port}.json")
+    with open(config_path, 'w') as f:
+        json.dump(full_config, f, indent=2)
+    
+    return config_path, valid_proxies, None
 
 def run_core(core_path, config_path):
     cmd = [core_path, "run", "-c", config_path] if "xray" in core_path.lower() else [core_path, "-c", config_path]
@@ -921,15 +879,11 @@ def check_connection(local_port, domain, timeout):
         return False, str(e)
     
 def check_speed_download(local_port, url_file, timeout=10, conn_timeout=5, max_mb=5, min_kb=1):
-    # Получаем список целей из конфига или используем переданный url_file как приоритет
     targets = GLOBAL_CFG.get("speed_targets", [])
     
-    # Если передан конкретный URL (через аргументы), ставим его первым
     pool = [url_file] + targets if url_file else list(targets)
-    # Перемешиваем дефолтный пул, чтобы потоки не долбили один сервер (кроме первого, если он задан)
     if not url_file: random.shuffle(pool)
     
-    # Очищаем пустые
     pool = [u for u in pool if u]
     if not pool: return 0.0
 
@@ -983,89 +937,71 @@ def check_speed_download(local_port, url_file, timeout=10, conn_timeout=5, max_m
         except Exception:
             pass
 
-def Checker(proxyList, localPort, testDomain, timeOut, t2exec, t2kill, checkSpeed=False, speedUrl="", sortBy="ping", speedCfg=None, speedSemaphore=None):
-    liveProxy = []
+def Checker(proxyList, localPortStart, testDomain, timeOut, t2exec, t2kill, 
+            checkSpeed=False, speedUrl="", sortBy="ping", speedCfg=None, 
+            speedSemaphore=None, maxInternalThreads=50, 
+            progress=None, task_id=None):
     
-    if speedCfg is None:
-        speedCfg = {"timeout": 10, "conn_timeout": 5, "max_mb": 5, "min_kb": 1}
+    current_live_results = []
+    if speedCfg is None: speedCfg = {}
 
-    for url in proxyList:
-        if CTRL_C: break
+    configPath, valid_mapping, err = create_batch_config_file(proxyList, localPortStart, TEMP_DIR)
+    if err or not valid_mapping:
+        return current_live_results
+
+    proc = run_core(CORE_PATH, configPath)
+    if not proc:
+        return current_live_results
+
+    if not wait_for_core_start(valid_mapping[0][1], t2exec):
+        kill_core(proc)
+        return current_live_results
+
+    def check_single_port(item):
+        if CTRL_C: return None
+        target_url, target_port = item
+        proxy_tag = get_proxy_tag(target_url)
         
-        tag = get_proxy_tag(url)
-        configName, err_msg = create_config_file(url, localPort, TEMP_DIR)
+        ping_res, error_reason = check_connection(target_port, testDomain, timeOut)
         
-        if not configName:
-            safe_print(f"{Fore.RED}[Skip] {tag[:15]}.. -> {err_msg}{Style.RESET_ALL}")
-            continue
-
-        proc = run_core(CORE_PATH, configName)
-        if not proc:
-            safe_print(f"{Fore.RED}[Err] Core start fail{Style.RESET_ALL}")
-            try: os.remove(configName)
-            except: pass
-            continue
-
-        is_ready = wait_for_core_start(localPort, t2exec)
-        
-        if not is_ready:
-            if proc.poll() is not None:
-                safe_print(f"{Fore.RED}[Dead] {tag[:15]}.. -> Core crashed{Style.RESET_ALL}")
-            else:
-                safe_print(f"{Fore.RED}[Dead] {tag[:15]}.. -> Core timeout{Style.RESET_ALL}")
-            
-            kill_core(proc)
-            try: os.remove(configName)
-            except: pass
-            continue
-            
-        ping, error_reason = check_connection(localPort, testDomain, timeOut)
-        speed = 0.0
-
-        if ping:
+        proxy_speed = 0.0
+        if ping_res:
             if checkSpeed:
-                safe_print(f"[blue][TEST][/] Measuring speed for {tag[:15]}...")
-                
-                if speedSemaphore:
-                    with speedSemaphore:
-                        speed = check_speed_download(
-                            localPort, speedUrl, 
-                            timeout=speedCfg['timeout'],
-                            conn_timeout=speedCfg['conn_timeout'],
-                            max_mb=speedCfg['max_mb'],
-                            min_kb=speedCfg['min_kb']
-                        )
-                else:
-                    speed = check_speed_download(
-                        localPort, speedUrl, 
-                        timeout=speedCfg['timeout'],
-                        conn_timeout=speedCfg['conn_timeout'],
-                        max_mb=speedCfg['max_mb'],
-                        min_kb=speedCfg['min_kb']
-                    )
-                
-                sp_color = "red"
-                if speed > 5: sp_color = "yellow"
-                if speed > 15: sp_color = "green"
-                if speed > 50: sp_color = "bold cyan"
-
-                safe_print(f"[green][LIVE][/] {ping}ms | [{sp_color}]{speed} Mbps[/] | {tag}")
+                with (speedSemaphore if speedSemaphore else Lock()):
+                    proxy_speed = check_speed_download(target_port, speedUrl, **speedCfg)
+                sp_color = "green" if proxy_speed > 15 else "yellow" if proxy_speed > 5 else "red"
+                safe_print(f"[green][LIVE][/] {ping_res}ms | [{sp_color}]{proxy_speed} Mbps[/] | {proxy_tag}")
             else:
-                safe_print(f"[green][LIVE][/] {ping}ms | {tag}")
+                safe_print(f"[green][LIVE][/] {ping_res}ms | {proxy_tag}")
             
-            liveProxy.append((url, ping, speed))
+            if progress and task_id is not None:
+                progress.advance(task_id, 1)
+            return (target_url, ping_res, proxy_speed)
+        
         else:
             short_err = str(error_reason)
-            if "SOCKSHTTPSConnectionPool" in short_err: short_err = "Conn Error"
-            elif "Read timed out" in short_err: short_err = "Timeout"
-            safe_print(f"[yellow][Dead][/] {tag[:15]}.. -> [dim]{short_err}[/]")
+            if "Read timed out" in short_err: short_err = "Timeout"
+            elif "Connection aborted" in short_err: short_err = "Conn Aborted"
+            safe_print(f"[yellow][Dead][/] {proxy_tag[:15]}.. -> [dim]{short_err}[/]")
+            
+            if progress and task_id is not None:
+                progress.advance(task_id, 1)
+            return None
 
-        kill_core(proc)
-        time.sleep(t2kill)
-        try: os.remove(configName)
-        except: pass
+    max_workers = min(len(valid_mapping), maxInternalThreads)
+    with ThreadPoolExecutor(max_workers=max_workers) as inner_exec:
+        raw_results = list(inner_exec.map(check_single_port, valid_mapping))
+    
+    current_live_results = [r for r in raw_results if r is not None]
 
-    return liveProxy
+    kill_core(proc)
+    time.sleep(t2kill)
+    try:
+        if os.path.exists(configPath):
+            os.remove(configPath)
+    except: pass
+    
+    return current_live_results
 
 def run_logic(args):
     global CORE_PATH, CTRL_C
@@ -1079,7 +1015,7 @@ def run_logic(args):
                  break
     
     if not CORE_PATH:
-        safe_print(f"[bold red]\n[ERROR] Ядро (xray/v2ray) не найдено! Убедитесь, что файл рядом.[/]")
+        safe_print(f"[bold red]\n[ERROR] Ядро (xray/v2ray) не найдено![/]")
         return
         
     safe_print(f"[dim]Core detected: {CORE_PATH}[/]")
@@ -1087,7 +1023,6 @@ def run_logic(args):
     safe_print(f"[yellow]>> Очистка зависших процессов ядра...[/]")
     killed_count = 0
     target_names = [os.path.basename(CORE_PATH).lower(), "xray.exe", "v2ray.exe", "xray", "v2ray"]
-    
     for proc in psutil.process_iter(['pid', 'name']):
         try:
             if proc.info['name'] and proc.info['name'].lower() in target_names:
@@ -1095,9 +1030,7 @@ def run_logic(args):
                 killed_count += 1
         except: pass
     
-    if killed_count > 0:
-        safe_print(f"[green]>> Убито старых процессов: {killed_count}[/]")
-    
+    if killed_count > 0: safe_print(f"[green]>> Убито старых процессов: {killed_count}[/]")
     time.sleep(0.5)
     
     lines = set()
@@ -1111,31 +1044,21 @@ def run_logic(args):
                 parsed, count = parse_content(f.read())
                 total_found_raw += count
                 lines.update(parsed)
-        else:
-            safe_print(f"[bold red]Файл не найден: {fpath}[/]")
 
     if args.url:
         links = fetch_url(args.url)
         lines.update(links)
 
     if AGGREGATOR_AVAILABLE and getattr(args, 'agg', False):
-        safe_print(f"[cyan]>> Запуск агрегатора через CLI...[/]")
         sources_map = GLOBAL_CFG.get("sources", {})
         cats = args.agg_cats if args.agg_cats else list(sources_map.keys())
         kws = args.agg_filter if args.agg_filter else []
-        
         try:
-            try:
-                agg_links = aggregator.get_aggregated_links(sources_map, cats, kws, log_func=safe_print, console=console)
-            except TypeError:
-                agg_links = aggregator.get_aggregated_links(sources_map, cats, kws, log_func=safe_print)
-                
+            agg_links = aggregator.get_aggregated_links(sources_map, cats, kws, log_func=safe_print, console=console)
             lines.update(agg_links)
-        except Exception as e:
-            safe_print(f"[bold red]Ошибка агрегатора CLI: {e}[/]")
+        except: pass
 
     if hasattr(args, 'direct_list') and args.direct_list:
-        safe_print(f"[cyan]>> Получено из агрегатора: {len(args.direct_list)} шт.[/]")
         parsed_agg, _ = parse_content("\n".join(args.direct_list))
         lines.update(parsed_agg)
 
@@ -1145,33 +1068,31 @@ def run_logic(args):
             lines.update(parsed)
 
     full = list(lines)
-    
-    if total_found_raw > 0:
-        duplicates = total_found_raw - len(full)
-        if duplicates > 0:
-            safe_print(f"[yellow]Найдено: {total_found_raw}. Дубликатов: {duplicates}. К проверке: {len(full)}[/]")
-        else:
-             safe_print(f"[cyan]Загружено прокси: {len(full)}[/]")
-    
     if not full:
         safe_print(f"[bold red]Нет прокси для проверки.[/]")
         return
 
-    if args.shuffle: random.shuffle(full)
-    if args.number: full = full[:args.number]
+    p_per_batch = GLOBAL_CFG.get("proxies_per_batch", 50)
+    needed_cores = (len(full) + p_per_batch - 1) // p_per_batch
+    threads = min(args.threads, needed_cores)
+    if threads < 1: threads = 1
 
-    threads = min(args.threads, len(full))
-    ports = []
-    p = args.lport
-    while len(ports) < threads:
-        if not is_port_in_use(p):
-            ports.append(p)
-        p += 1
-    
     chunks = list(split_list(full, threads))
+    ports = []
+    curr_p = args.lport
+    for chunk in chunks:
+        ports.append(curr_p)
+        curr_p += len(chunk) + 10 
+    
     results = []
     
-    console.print(f"\n[magenta]Запуск {threads} потоков... (SpeedCheck: {args.speed_check}, Sort: {args.sort_by})[/]")
+    speed_config_map = {
+        "timeout": GLOBAL_CFG.get("speed_download_timeout", 10),
+        "conn_timeout": GLOBAL_CFG.get("speed_connect_timeout", 5),
+        "max_mb": GLOBAL_CFG.get("speed_max_mb", 5),
+        "min_kb": GLOBAL_CFG.get("speed_min_kb", 1)
+    }
+    speed_semaphore = Semaphore(GLOBAL_CFG.get("speed_check_threads", 3))
 
     progress_columns = [
         SpinnerColumn(style="bold yellow"),
@@ -1183,57 +1104,36 @@ def run_logic(args):
         TimeRemainingColumn(),
     ]
 
-    with Progress(*progress_columns, console=console, transient=False) as progress:
-        task_id = progress.add_task("[cyan]Checking proxies...", total=len(full))
-        
-    speed_config_map = {
-        "timeout": GLOBAL_CFG.get("speed_download_timeout", 10),
-        "conn_timeout": GLOBAL_CFG.get("speed_connect_timeout", 5),
-        "max_mb": GLOBAL_CFG.get("speed_max_mb", 5),
-        "min_kb": GLOBAL_CFG.get("speed_min_kb", 1)
-    }
-    
-    max_speed_threads = GLOBAL_CFG.get("speed_check_threads", 3)
-    speed_semaphore = Semaphore(max_speed_threads)
-    
-    if args.speed_check:
-        safe_print(f"[magenta]>> Ограничение потоков спидтеста: {max_speed_threads}[/]")
+    console.print(f"\n[magenta]Запуск {threads} ядер (пачек) для {len(full)} прокси...[/]")
 
     with Progress(*progress_columns, console=console, transient=False) as progress:
         task_id = progress.add_task("[cyan]Checking proxies...", total=len(full))
         
         with ThreadPoolExecutor(max_workers=threads) as executor:
-            future_to_count = {}
-            
-            for i in range(threads):
-                if i < len(chunks) and chunks[i]:
-                    ft = executor.submit(
-                        Checker, chunks[i], ports[i], args.domain, args.timeout, 
-                        args.t2exec, args.t2kill, args.speed_check, args.speed_test_url, args.sort_by,
-                        speed_config_map,
-                        speed_semaphore
-                    )
-                    future_to_count[ft] = len(chunks[i])
+            futures = []
+            for i in range(len(chunks)):
+                ft = executor.submit(
+                    Checker, chunks[i], ports[i], args.domain, args.timeout, 
+                    args.t2exec, args.t2kill, args.speed_check, args.speed_test_url, args.sort_by,
+                    speed_config_map, speed_semaphore,
+                    GLOBAL_CFG.get("max_internal_threads", 50),
+                    progress, task_id
+                )
+                futures.append(ft)
             
             try:
-                for f in as_completed(future_to_count):
+                for f in as_completed(futures):
                     chunk_result = f.result()
-                    results.extend(chunk_result)
-                    
-                    processed_count = future_to_count[f]
-                    progress.advance(task_id, advance=processed_count)
-                    
+                    if chunk_result:
+                        results.extend(chunk_result)
             except KeyboardInterrupt:
                 CTRL_C = True
-                safe_print(f"\n[bold red]!!! Остановка по CTRL+C !!![/]")
                 executor.shutdown(wait=False)
 
     if args.sort_by == "speed":
         results.sort(key=lambda x: x[2], reverse=True)
-        safe_print(f"\n[cyan]>> Отсортировано по СКОРОСТИ (по убыванию)[/]")
     else:
         results.sort(key=lambda x: x[1])
-        safe_print(f"\n[cyan]>> Отсортировано по ПИНГУ (по возрастанию)[/]")
     
     with open(args.output, 'w', encoding='utf-8') as f:
         for r in results:
@@ -1242,25 +1142,20 @@ def run_logic(args):
     if results:
         table = Table(title=f"Результаты (Топ 15 из {len(results)})", box=box.ROUNDED)
         table.add_column("Ping", justify="right", style="green")
-        
         if args.speed_check:
             table.add_column("Speed (Mbps)", justify="right", style="bold cyan")
-            
         table.add_column("Tag / Protocol", justify="left", overflow="fold")
 
         for r in results[:15]:
             tag_display = get_proxy_tag(r[0])
             if len(tag_display) > 50: tag_display = tag_display[:47] + "..."
-            
             if args.speed_check:
                 table.add_row(f"{r[1]} ms", f"{r[2]}", tag_display)
             else:
                 table.add_row(f"{r[1]} ms", tag_display)
-
         console.print(table)
             
-    safe_print(f"\n[bold green]Готово! Рабочих: {len(results)}[/]")
-    safe_print(f"[bold green]Результат сохранен в: [white]{args.output}[/]")
+    safe_print(f"\n[bold green]Готово! Рабочих: {len(results)}. Результат в: {args.output}[/]")
 
 def print_banner():
     console.clear()
