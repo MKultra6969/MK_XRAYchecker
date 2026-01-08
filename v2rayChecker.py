@@ -451,7 +451,10 @@ class SmartLogger:
         self.lock = Lock()
         try:
             with open(self.filename, 'a', encoding='utf-8') as f:
-                f.write(f"\n{'-'*30} NEW SESSION {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {'-'*30}\n")
+                f.write(
+    f"\n{'-'*30} NEW SESSION v{__version__} "
+    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {'-'*30}\n"
+)
         except Exception as e:
             console.print(f"[bold red]Ошибка создания лога: {e}[/]")
 
@@ -1769,7 +1772,7 @@ def print_banner():
     
     panel = Panel(
         logo_text,
-        title=f"[bold magenta]MK_XRAYchecker[/] [dim](font: {font_name})[/]",
+        title=f"[bold magenta]MK_XRAYchecker v{__version__}[/] [dim](font: {font_name})[/]",
         subtitle="[bold red]by mkultra69 with HATE[/]",
         border_style="cyan",
         box=box.DOUBLE,
@@ -1858,6 +1861,7 @@ def interactive_menu():
         table.add_row("6", "Загрузить лог", "Отправить последние события на paste.rs")
         table.add_row("0", "Выход", "Закрыть программу")
         
+        console.print(f"[dim]Version: v{__version__}[/]")
         console.print(table)
         
         valid_choices = ["0", "1", "2", "3", "4", "5", "6"] if AGGREGATOR_AVAILABLE else ["0", "1", "2", "3", "5", "6"]
