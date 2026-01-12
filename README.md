@@ -13,8 +13,8 @@
   <a href="http://www.wtfpl.net/">
     <img src="https://img.shields.io/badge/LICENSE-WTFPL-red?style=for-the-badge" alt="License">
   </a>
-  <a href="https://t.me/MKextera">
-    <img src="https://img.shields.io/badge/Telegram-MKextera-blue?style=for-the-badge&logo=telegram" alt="Telegram">
+  <a href="https://t.me/MKplusULTRA">
+    <img src="https://img.shields.io/badge/Telegram-MKplusULTRA-blue?style=for-the-badge&logo=telegram" alt="Telegram">
   </a>
 </p>
 
