@@ -2627,12 +2627,12 @@ def print_banner():
     )
     
     console.print(panel, justify="center")
-    console.print("[dim]GitHub: https://github.com/MKultra6969 | Telegram: https://t.me/MKextera[/]", justify="center")
+    console.print("[dim]GitHub: https://github.com/MKultra6969 | Telegram: https://t.me/MKplusULTRA[/]", justify="center")
     console.print("─"*75, style="dim", justify="center")
     
     try:
         MAIN_LOGGER.log("MK_XRAYchecker by mkultra69 with HATE")
-        MAIN_LOGGER.log("https://t.me/MKextera")
+        MAIN_LOGGER.log("https://t.me/MKplusULTRA")
     except: pass
 
 def kill_all_cores_manual():
