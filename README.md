@@ -18,7 +18,7 @@
   </a>
 </p>
 
-<img width="1450" height="743" alt="Main menu" src="https://github.com/user-attachments/assets/899354d6-c462-4d64-9d7f-657d5cec010e" />
+<img width="1453" height="744" alt="Main menu" src="https://github.com/user-attachments/assets/7e59a198-b656-4214-acc7-5058f37fdc84" />
 Главное меню v1.1.3
 
 
