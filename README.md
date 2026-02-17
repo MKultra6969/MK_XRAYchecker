@@ -8,7 +8,7 @@
 
 <p>
   <a href="https://github.com/MKultra6969/MK_XRAYchecker">
-    <img src="https://img.shields.io/badge/VERSION-1.1.0-magenta?style=for-the-badge&logo=python" alt="Version">
+    <img src="https://img.shields.io/badge/VERSION-1.1.3-magenta?style=for-the-badge&logo=python" alt="Version">
   </a>
   <a href="http://www.wtfpl.net/">
     <img src="https://img.shields.io/badge/LICENSE-WTFPL-red?style=for-the-badge" alt="License">
@@ -18,8 +18,8 @@
   </a>
 </p>
 
-<img width="2086" height="630" alt="Main menu" src="https://github.com/user-attachments/assets/2dd08923-b671-4c0f-b631-83c0622d359b" />
-Главное меню v1.1.0
+<img width="1450" height="743" alt="Main menu" src="https://github.com/user-attachments/assets/899354d6-c462-4d64-9d7f-657d5cec010e" />
+Главное меню v1.1.3
 
 
 </div>
