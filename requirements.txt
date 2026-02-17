@@ -4,3 +4,4 @@ psutil
 pysocks
 rich
 art
+pyyaml

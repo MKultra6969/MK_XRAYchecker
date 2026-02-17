@@ -16,13 +16,19 @@ import tempfile
 import subprocess
 import zipfile
 import tarfile
+import gzip
 import requests
 
-__version__ = "1.0.0"
+__version__ = "1.1.3"
 
 XRAY_REPO = {
     "owner": "XTLS",
     "repo": "Xray-core"
+}
+
+MIHOMO_REPO = {
+    "owner": "MetaCubeX",
+    "repo": "mihomo"
 }
 
 INSTALL_DIR = "bin"
@@ -179,6 +185,50 @@ def get_specific_xray_release(version):
     
     return None
 
+def _get_github_release(repo_cfg, tag=None):
+    if tag:
+        api_url = f"https://api.github.com/repos/{repo_cfg['owner']}/{repo_cfg['repo']}/releases/tags/{tag}"
+    else:
+        api_url = f"https://api.github.com/repos/{repo_cfg['owner']}/{repo_cfg['repo']}/releases/latest"
+
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": f"v2rayChecker-XrayInstaller/{__version__}"
+    }
+
+    try:
+        resp = requests.get(api_url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            if resp.status_code == 404 and tag:
+                _safe_print(f"[yellow]Версия {tag} не найдена[/]")
+            else:
+                _safe_print(f"[yellow]GitHub API вернул {resp.status_code}[/]")
+            return None
+
+        data = resp.json()
+        return {
+            "tag_name": data.get("tag_name", ""),
+            "version": data.get("tag_name", "").lstrip('v'),
+            "assets": data.get("assets", []),
+            "published_at": data.get("published_at", ""),
+            "html_url": data.get("html_url", ""),
+        }
+    except requests.exceptions.Timeout:
+        _safe_print("[yellow]Таймаут при обращении к GitHub API[/]")
+    except requests.exceptions.RequestException as e:
+        _safe_print(f"[yellow]Ошибка сети: {e}[/]")
+    except Exception as e:
+        _safe_print(f"[yellow]Ошибка получения релиза: {e}[/]")
+    return None
+
+def get_latest_mihomo_release():
+    _safe_print("[dim]Проверка последней версии Mihomo...[/]")
+    return _get_github_release(MIHOMO_REPO)
+
+def get_specific_mihomo_release(version):
+    tag = version if version.startswith('v') else f"v{version}"
+    return _get_github_release(MIHOMO_REPO, tag=tag)
+
 def get_current_xray_version(core_path):
 
     if not core_path or not os.path.exists(core_path):
@@ -208,6 +258,125 @@ def get_current_xray_version(core_path):
         _safe_print(f"[dim]Ошибка получения версии Xray: {e}[/]")
     
     return None
+
+def _resolve_mihomo_asset(release_info):
+    if not release_info:
+        return None, None
+
+    raw_os = platform.system().lower()
+    raw_arch = platform.machine().lower()
+
+    os_tokens_map = {
+        "windows": ["windows", "win"],
+        "linux": ["linux"],
+        "darwin": ["darwin", "macos", "mac", "osx"],
+        "freebsd": ["freebsd"],
+        "openbsd": ["openbsd"],
+    }
+    arch_tokens_map = {
+        "x86_64": ["amd64", "x86_64", "x64"],
+        "amd64": ["amd64", "x86_64", "x64"],
+        "x64": ["amd64", "x86_64", "x64"],
+        "i386": ["386", "i386", "x86"],
+        "i686": ["386", "i386", "x86"],
+        "x86": ["386", "i386", "x86"],
+        "aarch64": ["arm64", "aarch64"],
+        "arm64": ["arm64", "aarch64"],
+        "armv7l": ["armv7", "arm", "armv7l"],
+        "armv7": ["armv7", "arm"],
+        "riscv64": ["riscv64"],
+        "s390x": ["s390x"],
+        "ppc64le": ["ppc64le"],
+    }
+
+    os_tokens = os_tokens_map.get(raw_os, [raw_os])
+    arch_tokens = arch_tokens_map.get(raw_arch, [raw_arch])
+
+    candidates = []
+    for asset in release_info.get("assets", []):
+        name = asset.get("name", "")
+        lname = name.lower()
+        if "mihomo" not in lname:
+            continue
+        if not lname.endswith((".zip", ".gz", ".tgz", ".tar.gz")):
+            continue
+        if any(x in lname for x in ("sha256", "sha512", "sum", "sums", ".sig", "signature", "sbom", ".txt")):
+            continue
+        if not any(tok in lname for tok in os_tokens):
+            continue
+        if not any(tok in lname for tok in arch_tokens):
+            continue
+
+        score = 0
+        if "compatible" in lname:
+            score += 30
+        if lname.endswith(".zip"):
+            score += 10
+        if "alpha" not in lname:
+            score += 2
+        candidates.append((score, len(name), asset))
+
+    if not candidates:
+        return None, None
+
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    best_asset = candidates[0][2]
+    return best_asset.get("name"), best_asset.get("browser_download_url")
+
+def _extract_mihomo_archive(tmp_path, asset_name, install_path, os_name):
+    tmp_extract_dir = tempfile.mkdtemp(prefix="mihomo_extract_")
+    try:
+        lower_name = (asset_name or "").lower()
+        if lower_name.endswith(".zip"):
+            with zipfile.ZipFile(tmp_path, 'r') as zf:
+                zf.extractall(tmp_extract_dir)
+        elif lower_name.endswith(".tar.gz") or lower_name.endswith(".tgz"):
+            with tarfile.open(tmp_path, 'r:gz') as tf:
+                tf.extractall(tmp_extract_dir)
+        elif lower_name.endswith(".gz"):
+            out_name = os.path.splitext(os.path.basename(asset_name))[0] or "mihomo"
+            out_path = os.path.join(tmp_extract_dir, out_name)
+            with gzip.open(tmp_path, 'rb') as src, open(out_path, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+        else:
+            _safe_print(f"[red]Неподдерживаемый архив Mihomo: {asset_name}[/]")
+            return None
+
+        core_candidates = []
+        for root, _, files in os.walk(tmp_extract_dir):
+            for fname in files:
+                lname = fname.lower()
+                if "mihomo" not in lname and "clash-meta" not in lname:
+                    continue
+                if os_name == "windows" and not lname.endswith(".exe"):
+                    continue
+                if os_name != "windows" and lname.endswith(".exe"):
+                    continue
+                full_path = os.path.join(root, fname)
+                try:
+                    size = os.path.getsize(full_path)
+                except Exception:
+                    size = 0
+                core_candidates.append((size, full_path))
+
+        if not core_candidates:
+            _safe_print("[red]Бинарник mihomo не найден в архиве[/]")
+            return None
+
+        core_candidates.sort(key=lambda x: x[0], reverse=True)
+        selected_binary = core_candidates[0][1]
+
+        final_name = "mihomo.exe" if os_name == "windows" else "mihomo"
+        final_path = os.path.join(install_path, final_name)
+        if os.path.exists(final_path):
+            os.remove(final_path)
+        shutil.move(selected_binary, final_path)
+        return final_path
+    finally:
+        try:
+            shutil.rmtree(tmp_extract_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 def download_and_install_xray(release_info, cfg):
 
@@ -334,6 +503,71 @@ def download_and_install_xray(release_info, cfg):
     
     return extracted_binary
 
+def download_and_install_mihomo(release_info, cfg):
+    if not release_info:
+        return None
+
+    os_name, _ = resolve_platform()
+    if not os_name:
+        _safe_print("[red]Не удалось определить платформу[/]")
+        return None
+
+    asset_name, download_url = _resolve_mihomo_asset(release_info)
+    if not download_url:
+        _safe_print("[red]Не найден подходящий ассет mihomo для текущей платформы[/]")
+        names = [a.get("name", "") for a in release_info.get("assets", [])]
+        _safe_print(f"[dim]Доступные ассеты: {names}[/]")
+        return None
+
+    script_dir = _get_script_dir()
+    install_path = os.path.join(script_dir, INSTALL_DIR)
+    os.makedirs(install_path, exist_ok=True)
+
+    lower_asset = asset_name.lower()
+    if lower_asset.endswith(".tar.gz"):
+        suffix = ".tar.gz"
+    elif lower_asset.endswith(".tgz"):
+        suffix = ".tgz"
+    elif lower_asset.endswith(".zip"):
+        suffix = ".zip"
+    elif lower_asset.endswith(".gz"):
+        suffix = ".gz"
+    else:
+        suffix = ".tmp"
+
+    _safe_print(f"[cyan]Скачивание Mihomo {release_info['version']} ({asset_name})...[/]")
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+            tmp_path = tmp_file.name
+            resp = requests.get(download_url, stream=True, timeout=180)
+            resp.raise_for_status()
+            for chunk in resp.iter_content(chunk_size=65536):
+                if chunk:
+                    tmp_file.write(chunk)
+
+        extracted_binary = _extract_mihomo_archive(tmp_path, asset_name, install_path, os_name)
+        if not extracted_binary:
+            return None
+
+        if os_name != "windows":
+            os.chmod(
+                extracted_binary,
+                os.stat(extracted_binary).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+            )
+
+        _safe_print(f"[bold green]✓ Mihomo {release_info['version']} установлен в {extracted_binary}[/]")
+        return extracted_binary
+    except Exception as e:
+        _safe_print(f"[red]Ошибка установки Mihomo: {e}[/]")
+        return None
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
 def ensure_xray_installed(cfg):
 
     script_dir = _get_script_dir()
@@ -394,6 +628,65 @@ def ensure_xray_installed(cfg):
     installed_path = download_and_install_xray(release_info, cfg)
     
     return installed_path
+
+def ensure_mihomo_installed(cfg):
+    script_dir = _get_script_dir()
+    os_name, _ = resolve_platform()
+    binary_name = "mihomo.exe" if os_name == "windows" else "mihomo"
+
+    possible_paths = [
+        os.path.join(script_dir, INSTALL_DIR, binary_name),
+        os.path.join(script_dir, binary_name),
+    ]
+
+    for path in possible_paths:
+        if os.path.exists(path):
+            _safe_print(f"[dim]Найден Mihomo: {path}[/]")
+            return path
+
+    autoinstall = cfg.get("autoinstall_mihomo", True)
+    target_version = cfg.get("mihomo_version", "latest")
+
+    if not autoinstall:
+        try:
+            from rich.prompt import Confirm
+            should_install = Confirm.ask(
+                "[bold yellow]Mihomo не найден. Установить автоматически?[/]",
+                default=True
+            )
+        except ImportError:
+            response = input("Mihomo не найден. Установить автоматически? [Y/n]: ").strip().lower()
+            should_install = response in ('', 'y', 'yes', 'д', 'да')
+
+        if not should_install:
+            _safe_print("[dim]Установка отменена пользователем[/]")
+            _safe_print("[dim]Скачайте Mihomo вручную: https://github.com/MetaCubeX/mihomo/releases[/]")
+            return None
+    else:
+        _safe_print("[yellow]Mihomo не найден, начинаем автоустановку...[/]")
+
+    if target_version == "latest":
+        release_info = get_latest_mihomo_release()
+    else:
+        release_info = get_specific_mihomo_release(target_version)
+        if not release_info:
+            _safe_print(f"[yellow]Версия {target_version} не найдена, используем latest[/]")
+            release_info = get_latest_mihomo_release()
+
+    if not release_info:
+        _safe_print("[red]Не удалось получить информацию о релизе Mihomo[/]")
+        return None
+
+    return download_and_install_mihomo(release_info, cfg)
+
+def ensure_core_installed(cfg, preferred_core="xray"):
+    preferred = (preferred_core or "xray").strip().lower()
+    if preferred == "mihomo":
+        installed = ensure_mihomo_installed(cfg)
+        if installed:
+            return installed
+        _safe_print("[yellow]Переходим на установку Xray как fallback[/]")
+    return ensure_xray_installed(cfg)
 
 
 def check_for_xray_update(core_path, cfg):

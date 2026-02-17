@@ -17,7 +17,7 @@ from datetime import datetime
 # ВЕРСИЯ И КОНФИГУРАЦИЯ
 # Эта версия используется для сравнения с GitHub releases
 # ═══════════════════════════════════════════════════════════════════════════
-__version__ = "1.1.0"
+__version__ = "1.1.3"
 
 # Настройки репо по умолчанию (можно переопределить через config.json)
 DEFAULT_REPO = {
@@ -31,6 +31,8 @@ DEFAULT_REPO = {
 MANAGED_FILES = [
     ("v2rayChecker.py", True),    # обязательный
     ("aggregator.py", False),     # опциональный
+    ("updater.py", True),         # обязательный
+    ("xray_installer.py", True)   # обязательный
 ]
 
 PENDING_MARKER = "update.pending"

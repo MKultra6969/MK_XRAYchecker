@@ -19,7 +19,7 @@
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
 # +═════════════════════════════════════════════════════════════════════════+
-# ║                           VERSION 1.0.4                                 ║
+# ║                           VERSION 1.1.3                                 ║
 # ║             В случае багов/недочётов создайте issue на github           ║
 # ║                                                                         ║
 # +═════════════════════════════════════════════════════════════════════════+
@@ -50,9 +50,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from types import SimpleNamespace
 from threading import Lock, Semaphore
 
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    yaml = None
+    YAML_AVAILABLE = False
+YAML_WARNED = False
+
 # ВЕРСИЯ СКРИПТА
 # Формат: MAJOR.MINOR.PATCH (SemVer)
-__version__ = "1.1.0"
+__version__ = "1.1.3"
 
 # --- REALITY / FLOW validation ---
 REALITY_PBK_RE = re.compile(r"^[A-Za-z0-9_-]{43,44}$")   # base64url publicKey
@@ -131,6 +139,7 @@ except ImportError:
 CONFIG_FILE = "config.json"
 SOURCES_FILE = "sources.json"
 
+# v1.1.3 Вероятно большинство ссылок ниже - мертвые.
 # Стандартные истончники проксей (вероятно они уже устарели, поэтому просто для примера.)
 DEFAULT_SOURCES_DATA = {
     "1": [
@@ -221,7 +230,7 @@ DEFAULT_SOURCES_DATA = {
 DEFAULT_CONFIG = {
     "core_path": "xray",  # путь до ядра, просто xray если лежит в обнимку с скриптом
     "threads": 20,        # Потоки
-    "proxies_per_batch": 50, # Сколько проксей обрабатывает ОДНО ядро xray
+    "proxies_per_batch": 50, # Сколько проксей обрабатывает ОДНО ядро
     "max_internal_threads": 50, # Сколько ПАРАЛЛЕЛЬНЫХ проверок идет внутри одного ядра
     "timeout": 3,         # Таймаут (повышать в случае огромного пинга)
     "local_port_start": 10000, # Отвечает за то, с какого конкретно порта будут запускаться ядра, 1080 > 1081 > 1082 = три потока(три ядра)
@@ -268,13 +277,25 @@ DEFAULT_CONFIG = {
     "repo_name": "MK_XRAYchecker",
     "repo_branch": "main",
 
-    # АВТОУСТАНОВКА XRAY CORE
+    # АВТОУСТАНОВКА ЯДРА
     # autoinstall_xray: True = автоматически скачать и установить Xray если не найден
     #                   False = спрашивать пользователя
     "autoinstall_xray": True,
     
     # xray_version: "latest" или конкретная версия типа "v1.8.10"
     "xray_version": "latest",
+
+    # Предпочитаемое ядро: auto | xray | mihomo
+    "preferred_core": "auto",
+
+    # Версия mihomo для автоустановки: "latest" или конкретный тег
+    "mihomo_version": "latest",
+
+    # autoinstall_mihomo: True = автоматически скачать и установить mihomo если не найден
+    "autoinstall_mihomo": True,
+
+    # Максимальный ping (мс) для отсева. 0 = не фильтровать по ping.
+    "max_ping_ms": 666,
 }
 
 def load_sources():
@@ -549,9 +570,28 @@ def upload_log_to_service(is_crash=False):
     
     return None
 
-TEMP_DIR = tempfile.mkdtemp()
+def init_temp_dir():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    preferred = os.path.join(script_dir, ".tmp_runtime")
+
+    for candidate in (preferred, tempfile.mkdtemp(prefix="mkxray_")):
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            probe = os.path.join(candidate, ".write_probe")
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(probe)
+            return candidate
+        except Exception:
+            continue
+
+    # Последний fallback: текущая директория
+    return script_dir
+
+TEMP_DIR = init_temp_dir()
 OS_SYSTEM = platform.system().lower()
 CORE_PATH = ""
+CORE_FLAVOR = "xray"
 CTRL_C = False
 
 LOGO_FONTS = [
@@ -595,11 +635,70 @@ def wait_for_core_start(port, max_wait):
         time.sleep(0.05) 
     return False
 
+def detect_core_flavor(core_path):
+    if not core_path:
+        return "xray"
+
+    lower_name = os.path.basename(core_path).lower()
+    if "mihomo" in lower_name or "clash" in lower_name:
+        return "mihomo"
+    if "xray" in lower_name or "v2ray" in lower_name:
+        return "xray"
+
+    for probe_cmd in ([core_path, "-v"], [core_path, "version"]):
+        try:
+            result = subprocess.run(
+                probe_cmd,
+                capture_output=True,
+                text=True,
+                timeout=3
+            )
+            output = f"{result.stdout}\n{result.stderr}".lower()
+            if "mihomo" in output or "clash" in output:
+                return "mihomo"
+            if "xray" in output or "v2ray" in output:
+                return "xray"
+        except Exception:
+            pass
+
+    return "xray"
+
+XRAY_CORE_CANDIDATES = ["xray.exe", "xray", "v2ray.exe", "v2ray", "bin/xray.exe", "bin/xray"]
+MIHOMO_CORE_CANDIDATES = ["mihomo.exe", "mihomo", "clash-meta.exe", "clash-meta", "bin/mihomo.exe", "bin/mihomo"]
+
+def build_core_candidates(engine_mode):
+    mode = str(engine_mode or "auto").strip().lower()
+    if mode == "xray":
+        return list(XRAY_CORE_CANDIDATES)
+    if mode == "mihomo":
+        return list(MIHOMO_CORE_CANDIDATES)
+    return XRAY_CORE_CANDIDATES + MIHOMO_CORE_CANDIDATES
+
+def save_main_config(cfg):
+    try:
+        save_cfg = cfg.copy()
+        if "sources" in save_cfg:
+            del save_cfg["sources"]
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(save_cfg, f, indent=4)
+        return True, None
+    except Exception as e:
+        return False, e
+
 
 def split_list(lst, n):
     if n <= 0: return []
     k, m = divmod(len(lst), n)
     return (lst[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n))
+
+def _looks_like_subscription_payload(text):
+    low = (text or "").lower()
+    return (
+        "proxies:" in low or
+        "proxy-providers:" in low or
+        "\"proxies\"" in low or
+        "'proxies'" in low
+    )
 
 def try_decode_base64(text):
     raw = text.strip()
@@ -622,7 +721,7 @@ def try_decode_base64(text):
             decoded = decoder(compact).decode("utf-8", errors="ignore")
         except Exception:
             continue
-        if any(marker in decoded for marker in PROTO_HINTS):
+        if any(marker in decoded for marker in PROTO_HINTS) or _looks_like_subscription_payload(decoded):
             return decoded
     return raw
 
@@ -647,11 +746,298 @@ def _payload_variants(blob):
             
     return variants
 
+def _first_scalar(value, default=""):
+    if isinstance(value, list):
+        for item in value:
+            if item not in (None, ""):
+                return str(item)
+        return default
+    if value in (None, ""):
+        return default
+    return str(value)
+
+def _bool_value(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in ("1", "true", "yes", "on"):
+            return True
+        if low in ("0", "false", "no", "off"):
+            return False
+    return default
+
+def _sanitize_yaml_text(payload):
+    # Некоторые провайдеры отдают YAML с C1 control chars (0x80-0x9F),
+    # что ломает safe_load. Удаляем только невалидные управляющие символы.
+    out = []
+    for ch in payload:
+        code = ord(ch)
+        if ch in ("\n", "\r", "\t"):
+            out.append(ch)
+            continue
+        if code < 0x20:
+            continue
+        if 0x7F <= code <= 0x9F:
+            continue
+        out.append(ch)
+    return "".join(out)
+
+def _parse_network_fields(proxy):
+    network = str(proxy.get("network", "tcp") or "tcp").strip().lower()
+    if not network:
+        network = "tcp"
+
+    path = ""
+    host = ""
+    service_name = ""
+
+    if network == "ws":
+        ws_opts = proxy.get("ws-opts", {}) if isinstance(proxy.get("ws-opts"), dict) else {}
+        path = _first_scalar(ws_opts.get("path"), "/")
+        headers = ws_opts.get("headers", {}) if isinstance(ws_opts.get("headers"), dict) else {}
+        host = _first_scalar(headers.get("Host"), "")
+        if _bool_value(ws_opts.get("v2ray-http-upgrade"), False):
+            network = "httpupgrade"
+
+    elif network == "http":
+        http_opts = proxy.get("http-opts", {}) if isinstance(proxy.get("http-opts"), dict) else {}
+        path = _first_scalar(http_opts.get("path"), "/")
+        headers = http_opts.get("headers", {}) if isinstance(http_opts.get("headers"), dict) else {}
+        host = _first_scalar(headers.get("Host"), "")
+
+    elif network == "h2":
+        h2_opts = proxy.get("h2-opts", {}) if isinstance(proxy.get("h2-opts"), dict) else {}
+        path = _first_scalar(h2_opts.get("path"), "/")
+        host = _first_scalar(h2_opts.get("host"), "")
+
+    elif network == "grpc":
+        grpc_opts = proxy.get("grpc-opts", {}) if isinstance(proxy.get("grpc-opts"), dict) else {}
+        service_name = _first_scalar(grpc_opts.get("grpc-service-name"), "")
+
+    return network, path, host, service_name
+
+def _build_subscription_vmess(proxy):
+    server = _first_scalar(proxy.get("server"), "")
+    port = proxy.get("port")
+    uuid = _first_scalar(proxy.get("uuid"), "")
+    if not server or not is_valid_port(port) or not is_valid_uuid(uuid):
+        return None
+
+    network, path, host, service_name = _parse_network_fields(proxy)
+    tls = _bool_value(proxy.get("tls"), False)
+    sni = _first_scalar(proxy.get("servername"), "") or _first_scalar(proxy.get("sni"), "")
+    fp = _first_scalar(proxy.get("client-fingerprint"), "")
+    alpn_raw = proxy.get("alpn")
+    if isinstance(alpn_raw, list):
+        alpn = ",".join([str(x) for x in alpn_raw if x])
+    else:
+        alpn = _first_scalar(alpn_raw, "")
+
+    node = {
+        "v": "2",
+        "ps": _first_scalar(proxy.get("name"), "vmess"),
+        "add": server,
+        "port": str(int(port)),
+        "id": uuid,
+        "aid": str(int(proxy.get("alterId", 0) or 0)),
+        "scy": _first_scalar(proxy.get("cipher"), "auto"),
+        "net": network,
+        "path": path,
+        "host": host,
+        "tls": "tls" if tls else "",
+        "sni": sni,
+        "fp": fp,
+        "alpn": alpn
+    }
+    if service_name:
+        node["serviceName"] = service_name
+    encoded = base64.b64encode(json.dumps(node, separators=(",", ":")).encode("utf-8")).decode("utf-8")
+    return f"vmess://{encoded}"
+
+def _build_subscription_vless(proxy):
+    server = _first_scalar(proxy.get("server"), "")
+    port = proxy.get("port")
+    uuid = _first_scalar(proxy.get("uuid"), "")
+    if not server or not is_valid_port(port) or not is_valid_uuid(uuid):
+        return None
+
+    network, path, host, service_name = _parse_network_fields(proxy)
+    reality_opts = proxy.get("reality-opts", {}) if isinstance(proxy.get("reality-opts"), dict) else {}
+    has_reality = bool(_first_scalar(reality_opts.get("public-key"), ""))
+    if has_reality:
+        security = "reality"
+    elif _bool_value(proxy.get("tls"), False):
+        security = "tls"
+    else:
+        security = "none"
+
+    query = {
+        "type": network,
+        "security": security,
+    }
+    if path:
+        query["path"] = path
+    if host:
+        query["host"] = host
+    if service_name:
+        query["serviceName"] = service_name
+
+    sni = _first_scalar(proxy.get("servername"), "") or _first_scalar(proxy.get("sni"), "")
+    fp = _first_scalar(proxy.get("client-fingerprint"), "")
+    alpn_raw = proxy.get("alpn")
+    if isinstance(alpn_raw, list):
+        alpn = ",".join([str(x) for x in alpn_raw if x])
+    else:
+        alpn = _first_scalar(alpn_raw, "")
+
+    if sni:
+        query["sni"] = sni
+    if fp:
+        query["fp"] = fp
+    if alpn:
+        query["alpn"] = alpn
+
+    flow = _first_scalar(proxy.get("flow"), "")
+    if flow:
+        query["flow"] = flow
+
+    pbk = _first_scalar(reality_opts.get("public-key"), "")
+    sid = _first_scalar(reality_opts.get("short-id"), "")
+    if pbk:
+        query["pbk"] = pbk
+    if sid:
+        query["sid"] = sid
+
+    q = urllib.parse.urlencode(query, doseq=False)
+    tag = urllib.parse.quote(_first_scalar(proxy.get("name"), "vless"))
+    return f"vless://{uuid}@{server}:{int(port)}?{q}#{tag}"
+
+def _build_subscription_trojan(proxy):
+    server = _first_scalar(proxy.get("server"), "")
+    port = proxy.get("port")
+    password = _first_scalar(proxy.get("password"), "")
+    if not server or not is_valid_port(port) or not password:
+        return None
+
+    network, path, host, service_name = _parse_network_fields(proxy)
+    query = {"type": network}
+    if _bool_value(proxy.get("tls"), True):
+        query["security"] = "tls"
+    sni = _first_scalar(proxy.get("servername"), "") or _first_scalar(proxy.get("sni"), "")
+    if sni:
+        query["sni"] = sni
+    if path:
+        query["path"] = path
+    if host:
+        query["host"] = host
+    if service_name:
+        query["serviceName"] = service_name
+    fp = _first_scalar(proxy.get("client-fingerprint"), "")
+    if fp:
+        query["fp"] = fp
+
+    q = urllib.parse.urlencode(query, doseq=False)
+    tag = urllib.parse.quote(_first_scalar(proxy.get("name"), "trojan"))
+    return f"trojan://{urllib.parse.quote(password, safe='')}@{server}:{int(port)}?{q}#{tag}"
+
+def _build_subscription_ss(proxy):
+    server = _first_scalar(proxy.get("server"), "")
+    port = proxy.get("port")
+    cipher = _first_scalar(proxy.get("cipher"), "")
+    password = _first_scalar(proxy.get("password"), "")
+    if not server or not is_valid_port(port) or not cipher or not password:
+        return None
+
+    auth = f"{cipher}:{password}"
+    encoded = base64.urlsafe_b64encode(auth.encode("utf-8")).decode("utf-8").rstrip("=")
+    tag = urllib.parse.quote(_first_scalar(proxy.get("name"), "ss"))
+    return f"ss://{encoded}@{server}:{int(port)}#{tag}"
+
+def _build_subscription_hysteria2(proxy):
+    server = _first_scalar(proxy.get("server"), "")
+    port = proxy.get("port")
+    password = _first_scalar(proxy.get("password"), "") or _first_scalar(proxy.get("auth-str"), "")
+    if not server or not is_valid_port(port) or not password:
+        return None
+
+    query = {}
+    sni = _first_scalar(proxy.get("sni"), "") or _first_scalar(proxy.get("servername"), "")
+    if sni:
+        query["sni"] = sni
+    if _bool_value(proxy.get("skip-cert-verify"), False):
+        query["insecure"] = "1"
+
+    obfs = _first_scalar(proxy.get("obfs"), "")
+    obfs_password = _first_scalar(proxy.get("obfs-password"), "")
+    if obfs:
+        query["obfs"] = obfs
+        if obfs_password:
+            query["obfs-password"] = obfs_password
+
+    q = urllib.parse.urlencode(query, doseq=False)
+    tag = urllib.parse.quote(_first_scalar(proxy.get("name"), "hy2"))
+    if q:
+        return f"hysteria2://{urllib.parse.quote(password, safe='')}@{server}:{int(port)}?{q}#{tag}"
+    return f"hysteria2://{urllib.parse.quote(password, safe='')}@{server}:{int(port)}#{tag}"
+
+def _extract_subscription_links(payload):
+    global YAML_WARNED
+    if not YAML_AVAILABLE:
+        if _looks_like_subscription_payload(payload) and not YAML_WARNED:
+            YAML_WARNED = True
+            safe_print("[yellow]Для парсинга Clash/Mihomo YAML-подписок установите PyYAML: pip install pyyaml[/]")
+        return []
+    if not _looks_like_subscription_payload(payload):
+        return []
+    sanitized_payload = _sanitize_yaml_text(payload)
+    if not sanitized_payload.strip():
+        return []
+    try:
+        data = yaml.safe_load(sanitized_payload)
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    proxies = data.get("proxies")
+    if not isinstance(proxies, list):
+        return []
+
+    links = []
+    for proxy in proxies:
+        if not isinstance(proxy, dict):
+            continue
+        ptype = _first_scalar(proxy.get("type"), "").lower()
+        link = None
+        if ptype == "vmess":
+            link = _build_subscription_vmess(proxy)
+        elif ptype == "vless":
+            link = _build_subscription_vless(proxy)
+        elif ptype == "trojan":
+            link = _build_subscription_trojan(proxy)
+        elif ptype in ("ss", "shadowsocks"):
+            link = _build_subscription_ss(proxy)
+        elif ptype in ("hysteria2", "hy2"):
+            link = _build_subscription_hysteria2(proxy)
+        if link:
+            links.append(link)
+    return links
+
 def parse_content(text):
     unique_links = set()
     raw_hits = 0
 
     for payload in _payload_variants(text):
+        sub_links = _extract_subscription_links(payload)
+        if sub_links:
+            raw_hits += len(sub_links)
+            for item in sub_links:
+                cleaned = clean_url(item.rstrip(';,)]}'))
+                if cleaned and len(cleaned) > 15:
+                    unique_links.add(cleaned)
+
         matches = URL_FINDER.findall(payload)
         raw_hits += len(matches)
         for item in matches:
@@ -659,7 +1045,24 @@ def parse_content(text):
             if cleaned and len(cleaned) > 15:
                 unique_links.add(cleaned)
 
-    return list(unique_links), raw_hits or len(unique_links)
+    return sorted(unique_links), raw_hits or len(unique_links)
+
+def extract_subscription_urls(text):
+    urls = set()
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(("- ", "* ")):
+            line = line[2:].strip()
+        if not line:
+            continue
+
+        first_token = line.split()[0].strip("\"'<>")
+        cleaned = clean_url(first_token.rstrip(';,)]}'))
+        if cleaned.lower().startswith(("http://", "https://")):
+            urls.add(cleaned)
+    return sorted(urls)
 
 def fetch_url(url):
     try:
@@ -706,8 +1109,11 @@ def parse_vless(url):
             v = val[0].strip()
             return re.sub(r'[^\x20-\x7E]', '', v) if v else default
         
-        net_type = get_p("type", "tcp").lower()
-        net_type = re.sub(r"[^a-z0-9]", "", net_type)
+        raw_net_type = get_p("type", "tcp").lower()
+        raw_net_type = re.sub(r"[^a-z0-9]", "", raw_net_type)
+        if not raw_net_type:
+            raw_net_type = "tcp"
+        net_type = raw_net_type
         if net_type in ["http", "h2"]:
             net_type = "xhttp"
         elif net_type == "httpupgrade":
@@ -772,6 +1178,7 @@ def parse_vless(url):
             "port": port,
             "encryption": get_p("encryption", "none"),
             "type": net_type,
+            "raw_type": raw_net_type,
             "security": security,
             "path": urllib.parse.unquote(get_p("path", "")),
             "host": get_p("host", ""),
@@ -823,7 +1230,11 @@ def parse_vmess(url):
                 raw_path = get_p("path", "")
                 final_path = urllib.parse.unquote(raw_path)
 
-                net_type = get_p("type", "tcp").lower()
+                raw_net_type = get_p("type", "tcp").lower()
+                raw_net_type = re.sub(r"[^a-z0-9]", "", raw_net_type)
+                if not raw_net_type:
+                    raw_net_type = "tcp"
+                net_type = raw_net_type
                 if net_type in ["http", "h2", "httpupgrade"]:
                     net_type = "xhttp"
             
@@ -833,6 +1244,7 @@ def parse_vmess(url):
                     "address": address,
                     "port": int(port),
                     "type": net_type,
+                    "raw_type": raw_net_type,
                     "security": get_p("security", "none"),
                     "path": final_path,
                     "host": get_p("host", ""),
@@ -860,7 +1272,11 @@ def parse_vmess(url):
             decoded = base64.b64decode(b64).decode('utf-8', errors='ignore')
             data = json.loads(decoded)
             
-            net_type = data.get("net", "tcp")
+            raw_net_type = str(data.get("net", "tcp")).lower()
+            raw_net_type = re.sub(r"[^a-z0-9]", "", raw_net_type)
+            if not raw_net_type:
+                raw_net_type = "tcp"
+            net_type = raw_net_type
             if net_type in ["http", "h2", "httpupgrade"]:
                 net_type = "xhttp"
             
@@ -871,6 +1287,7 @@ def parse_vmess(url):
                 "port": int(data.get("port", 0)),
                 "aid": int(data.get("aid", 0)),
                 "type": net_type,
+                "raw_type": raw_net_type,
                 "security": data.get("tls", "") if data.get("tls") else "none",
                 "path": data.get("path", ""),
                 "host": data.get("host", ""),
@@ -1007,6 +1424,197 @@ def parse_hysteria2(url):
         }
     except: return None
 
+def parse_proxy_url(proxy_url):
+    try:
+        proxy_url = clean_url(proxy_url)
+        if proxy_url.startswith("vless://"):
+            return parse_vless(proxy_url)
+        if proxy_url.startswith("vmess://"):
+            return parse_vmess(proxy_url)
+        if proxy_url.startswith("trojan://"):
+            return parse_trojan(proxy_url)
+        if proxy_url.startswith("ss://"):
+            return parse_ss(proxy_url)
+        if proxy_url.startswith("hy"):
+            return parse_hysteria2(proxy_url)
+    except Exception:
+        return None
+    return None
+
+def _mihomo_network_opts(proxy_conf):
+    raw_type = (proxy_conf.get("raw_type") or proxy_conf.get("type") or "tcp").lower()
+    raw_type = re.sub(r"[^a-z0-9]", "", raw_type)
+    if not raw_type:
+        raw_type = "tcp"
+
+    host = proxy_conf.get("host") or ""
+    path = proxy_conf.get("path") or "/"
+    hosts = [h.strip() for h in host.split(",") if h.strip()]
+
+    if raw_type in ("tcp", "", "none"):
+        return {}
+
+    if raw_type in ("ws", "websocket"):
+        ws_opts = {"path": path}
+        if host:
+            ws_opts["headers"] = {"Host": host}
+        return {
+            "network": "ws",
+            "ws-opts": ws_opts
+        }
+
+    if raw_type in ("httpupgrade", "xhttp"):
+        ws_opts = {
+            "path": path,
+            "v2ray-http-upgrade": True
+        }
+        if host:
+            ws_opts["headers"] = {"Host": host}
+        return {
+            "network": "ws",
+            "ws-opts": ws_opts
+        }
+
+    if raw_type == "h2":
+        h2_opts = {"path": path}
+        if hosts:
+            h2_opts["host"] = hosts
+        return {
+            "network": "h2",
+            "h2-opts": h2_opts
+        }
+
+    if raw_type == "http":
+        http_opts = {
+            "method": "GET",
+            "path": [path]
+        }
+        if hosts:
+            http_opts["headers"] = {"Host": hosts}
+        return {
+            "network": "http",
+            "http-opts": http_opts
+        }
+
+    if raw_type in ("grpc", "gun"):
+        service_name = proxy_conf.get("serviceName") or path.strip("/")
+        grpc_opts = {}
+        if service_name:
+            grpc_opts["grpc-service-name"] = service_name
+        data = {"network": "grpc"}
+        if grpc_opts:
+            data["grpc-opts"] = grpc_opts
+        return data
+
+    # Нестандартные типы не отбрасываем: пробуем как обычный tcp
+    return {}
+
+def get_mihomo_proxy_structure(proxy_url, name):
+    proxy_conf = parse_proxy_url(proxy_url)
+    if not proxy_conf:
+        return None
+    if not proxy_conf.get("address"):
+        return None
+    if not is_valid_port(proxy_conf.get("port")):
+        return None
+
+    proto = proxy_conf.get("protocol")
+    if proto in ("vless", "vmess") and not is_valid_uuid(proxy_conf.get("uuid")):
+        return None
+
+    transport = _mihomo_network_opts(proxy_conf)
+
+    base = {
+        "name": name,
+        "server": proxy_conf["address"],
+        "port": int(proxy_conf["port"]),
+        "udp": False
+    }
+
+    security = (proxy_conf.get("security") or "none").lower()
+    sni = proxy_conf.get("sni") or proxy_conf.get("host") or ""
+
+    if proto == "ss":
+        method = (proxy_conf.get("method") or "").lower().strip()
+        if method == "xchacha20-poly1305":
+            method = "xchacha20-ietf-poly1305"
+        if method not in SS_ALLOWED_METHODS:
+            return None
+        base.update({
+            "type": "ss",
+            "cipher": method,
+            "password": proxy_conf.get("password", "")
+        })
+        return base
+
+    if proto == "trojan":
+        if not proxy_conf.get("uuid"):
+            return None
+        base.update({
+            "type": "trojan",
+            "password": proxy_conf["uuid"],
+            "tls": True,
+            "skip-cert-verify": True
+        })
+        if sni:
+            base["servername"] = sni
+        base.update(transport or {})
+        return base
+
+    if proto == "hysteria2":
+        if not proxy_conf.get("uuid"):
+            return None
+        base.update({
+            "type": "hysteria2",
+            "password": proxy_conf["uuid"],
+            "skip-cert-verify": bool(proxy_conf.get("insecure", False))
+        })
+        if proxy_conf.get("sni"):
+            base["sni"] = proxy_conf["sni"]
+        if proxy_conf.get("obfs") and proxy_conf.get("obfs") != "none":
+            base["obfs"] = proxy_conf["obfs"]
+            if proxy_conf.get("obfs_password"):
+                base["obfs-password"] = proxy_conf["obfs_password"]
+        return base
+
+    if proto == "vmess":
+        base.update({
+            "type": "vmess",
+            "uuid": proxy_conf["uuid"],
+            "alterId": int(proxy_conf.get("aid", 0)),
+            "cipher": proxy_conf.get("scy") or "auto",
+        })
+    elif proto == "vless":
+        base.update({
+            "type": "vless",
+            "uuid": proxy_conf["uuid"],
+        })
+        if proxy_conf.get("flow"):
+            base["flow"] = proxy_conf["flow"]
+    else:
+        return None
+
+    if security in ("tls", "reality", "xtls"):
+        base["tls"] = True
+        base["skip-cert-verify"] = True
+        if sni:
+            base["servername"] = sni
+        fp = (proxy_conf.get("fp") or "").strip()
+        base["client-fingerprint"] = fp if fp else "chrome"
+
+    if security == "reality":
+        pbk = proxy_conf.get("pbk", "").strip()
+        if not pbk:
+            return None
+        reality_opts = {"public-key": pbk}
+        sid = (proxy_conf.get("sid") or "").strip()
+        if sid:
+            reality_opts["short-id"] = sid
+        base["reality-opts"] = reality_opts
+
+    base.update(transport or {})
+    return base
+
 def get_proxy_tag(url):
     tag = "proxy"
     try:
@@ -1037,13 +1645,7 @@ def is_valid_port(port):
 def get_outbound_structure(proxy_url, tag):
     try:
         proxy_url = clean_url(proxy_url)
-        proxy_conf = None
-        
-        if proxy_url.startswith("vless://"): proxy_conf = parse_vless(proxy_url)
-        elif proxy_url.startswith("vmess://"): proxy_conf = parse_vmess(proxy_url)
-        elif proxy_url.startswith("trojan://"): proxy_conf = parse_trojan(proxy_url)
-        elif proxy_url.startswith("ss://"): proxy_conf = parse_ss(proxy_url)
-        elif proxy_url.startswith("hy"): proxy_conf = parse_hysteria2(proxy_url)
+        proxy_conf = parse_proxy_url(proxy_url)
         
         if not proxy_conf or not proxy_conf.get("address"): return None
         if not is_valid_port(proxy_conf.get("port")): return None
@@ -1277,6 +1879,36 @@ def create_batch_config_file(proxy_list, start_port, work_dir):
     
     return config_path, valid_proxies, None
 
+def create_mihomo_config_file(proxy_url, local_port, work_dir):
+    proxy_name = f"out_{local_port}"
+    proxy_struct = get_mihomo_proxy_structure(proxy_url, proxy_name)
+    if not proxy_struct:
+        return None, None, "No valid proxy for mihomo"
+
+    full_config = {
+        "allow-lan": False,
+        "bind-address": "127.0.0.1",
+        "mode": "rule",
+        "log-level": "silent",
+        "ipv6": True,
+        "socks-port": local_port,
+        "proxies": [proxy_struct],
+        "proxy-groups": [
+            {
+                "name": "MK_CHECK",
+                "type": "select",
+                "proxies": [proxy_name]
+            }
+        ],
+        "rules": ["MATCH,MK_CHECK"]
+    }
+
+    config_path = os.path.join(work_dir, f"batch_{local_port}_mihomo.json")
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump(full_config, f, indent=2, ensure_ascii=False)
+
+    return config_path, [(proxy_url, local_port)], None
+
 def save_failed_batch(config_path, error_output, exit_code):
     try:
         failed_dir = os.path.join(os.getcwd(), "failed_batches")
@@ -1297,7 +1929,10 @@ def save_failed_batch(config_path, error_output, exit_code):
             f.write(error_output or "No output captured")
         
         safe_print(f"[yellow]📁 Debug files saved to: {failed_dir}[/]")
-        safe_print(f"[dim]   Reproduce: xray run -test -c \"{dest_json}\"[/]")
+        if CORE_FLAVOR == "mihomo":
+            safe_print(f"[dim]   Reproduce: \"{CORE_PATH}\" -f \"{dest_json}\"[/]")
+        else:
+            safe_print(f"[dim]   Reproduce: \"{CORE_PATH}\" run -test -c \"{dest_json}\"[/]")
         
         return dest_json, log_path
     except Exception as e:
@@ -1311,7 +1946,12 @@ def run_core(core_path, config_path):
             os.chmod(core_path, st.st_mode | stat.S_IXEXEC)
         except Exception as e:
             pass
-    cmd = [core_path, "run", "-c", config_path] if "xray" in core_path.lower() else [core_path, "-c", config_path]
+    if CORE_FLAVOR == "mihomo":
+        cmd = [core_path, "-f", config_path]
+    elif "xray" in core_path.lower():
+        cmd = [core_path, "run", "-c", config_path]
+    else:
+        cmd = [core_path, "-c", config_path]
     startupinfo = None
     if OS_SYSTEM == "windows":
         startupinfo = subprocess.STARTUPINFO()
@@ -1437,10 +2077,10 @@ def check_speed_download(local_port, url_file, timeout=10, conn_timeout=5, max_m
         except Exception:
             pass
 
-def Checker(proxyList, localPortStart, testDomain, timeOut, t2exec, t2kill, 
-            checkSpeed=False, speedUrl="", sortBy="ping", speedCfg=None, 
-            speedSemaphore=None, maxInternalThreads=50, 
-            progress=None, task_id=None):
+def Checker_xray(proxyList, localPortStart, testDomain, timeOut, t2exec, t2kill, 
+                 checkSpeed=False, speedUrl="", sortBy="ping", speedCfg=None, 
+                 speedSemaphore=None, maxInternalThreads=50, max_ping_ms=0,
+                 progress=None, task_id=None):
     
     current_live_results = []
     if speedCfg is None: speedCfg = {}
@@ -1519,14 +2159,7 @@ def Checker(proxyList, localPortStart, testDomain, timeOut, t2exec, t2kill,
         target_url, target_port = item
         
         proxy_speed = 0.0
-        
-        conf = None
-        try:
-            if target_url.startswith("vless://"): conf = parse_vless(target_url)
-            elif target_url.startswith("vmess://"): conf = parse_vmess(target_url)
-            elif target_url.startswith("ss://"): conf = parse_ss(target_url)
-            elif target_url.startswith("trojan://"): conf = parse_trojan(target_url)
-        except: pass
+        conf = parse_proxy_url(target_url)
         
         addr_info = f"{conf['address']}:{conf['port']}" if conf else "unknown"
         proxy_tag = get_proxy_tag(target_url)
@@ -1534,6 +2167,12 @@ def Checker(proxyList, localPortStart, testDomain, timeOut, t2exec, t2kill,
         ping_res, error_reason = check_connection(target_port, testDomain, timeOut)
         
         if ping_res:
+            if max_ping_ms and ping_res > max_ping_ms:
+                safe_print(f"[yellow][DROP][/] [white]{addr_info:<25}[/] | {ping_res:>4}ms > {max_ping_ms}ms | {proxy_tag}")
+                if progress and task_id is not None:
+                    progress.advance(task_id, 1)
+                return None
+
             if checkSpeed:
                 with (speedSemaphore if speedSemaphore else Lock()):
                     proxy_speed = check_speed_download(target_port, speedUrl, **speedCfg)
@@ -1566,8 +2205,125 @@ def Checker(proxyList, localPortStart, testDomain, timeOut, t2exec, t2kill,
     
     return current_live_results
 
+def Checker_mihomo(proxyList, localPortStart, testDomain, timeOut, t2exec, t2kill,
+                   checkSpeed=False, speedUrl="", sortBy="ping", speedCfg=None,
+                   speedSemaphore=None, maxInternalThreads=50, max_ping_ms=0,
+                   progress=None, task_id=None):
+    current_live_results = []
+    if speedCfg is None:
+        speedCfg = {}
+
+    for idx, target_url in enumerate(proxyList):
+        if CTRL_C:
+            break
+
+        target_port = localPortStart + idx
+        configPath, valid_mapping, err = create_mihomo_config_file(target_url, target_port, TEMP_DIR)
+        if err or not valid_mapping:
+            if progress and task_id is not None:
+                progress.advance(task_id, 1)
+            continue
+
+        proc = run_core(CORE_PATH, configPath)
+        if not proc:
+            try:
+                if os.path.exists(configPath):
+                    os.remove(configPath)
+            except Exception:
+                pass
+            if progress and task_id is not None:
+                progress.advance(task_id, 1)
+            continue
+
+        core_started = wait_for_core_start(target_port, max(t2exec, 4.0))
+        if core_started:
+            # Для mihomo нужен небольшой прогрев после открытия socks-порта,
+            # иначе при высоком параллелизме часто ловим transient 10053/EOF.
+            time.sleep(1.0)
+
+        if not core_started:
+            exitcode = proc.poll()
+            error_msg = "Core timeout"
+            try:
+                if proc.stdout:
+                    err_lines = []
+                    for line in proc.stdout:
+                        err_lines.append(line.strip())
+                        if len(err_lines) > 30:
+                            break
+                    if err_lines:
+                        error_msg = "\n".join(err_lines[-15:])
+            except Exception:
+                pass
+            safe_print(f"[bold red]BATCH FAILED[/] [yellow]Ядро не запустилось (Exit: {exitcode})[/]")
+            safe_print(f"[dim]Error: {error_msg[:300]}[/]")
+            save_failed_batch(configPath, error_msg, exitcode)
+            kill_core(proc)
+            try:
+                if os.path.exists(configPath):
+                    os.remove(configPath)
+            except Exception:
+                pass
+            if progress and task_id is not None:
+                progress.advance(task_id, 1)
+            continue
+
+        conf = parse_proxy_url(target_url)
+        addr_info = f"{conf['address']}:{conf['port']}" if conf else "unknown"
+        proxy_tag = get_proxy_tag(target_url)
+
+        proxy_speed = 0.0
+        ping_res, error_reason = check_connection(target_port, testDomain, timeOut)
+        if not ping_res and error_reason:
+            low_err = str(error_reason).lower()
+            if ("connection aborted" in low_err) or ("ssleoferror" in low_err) or ("eof" in low_err):
+                time.sleep(0.35)
+                ping_res, error_reason = check_connection(target_port, testDomain, timeOut)
+
+        if ping_res:
+            if max_ping_ms and ping_res > max_ping_ms:
+                safe_print(f"[yellow][DROP][/] [white]{addr_info:<25}[/] | {ping_res:>4}ms > {max_ping_ms}ms | {proxy_tag}")
+            else:
+                if checkSpeed:
+                    with (speedSemaphore if speedSemaphore else Lock()):
+                        proxy_speed = check_speed_download(target_port, speedUrl, **speedCfg)
+                    sp_color = "green" if proxy_speed > 15 else "yellow" if proxy_speed > 5 else "red"
+                    safe_print(f"[green][LIVE][/] [white]{addr_info:<25}[/] | {ping_res:>4}ms | [{sp_color}]{proxy_speed:>5} Mbps[/] | {proxy_tag}")
+                else:
+                    safe_print(f"[green][LIVE][/] [white]{addr_info:<25}[/] | {ping_res:>4}ms | {proxy_tag}")
+                current_live_results.append((target_url, ping_res, proxy_speed))
+
+        kill_core(proc)
+        time.sleep(t2kill)
+        try:
+            if os.path.exists(configPath):
+                os.remove(configPath)
+        except Exception:
+            pass
+
+        if progress and task_id is not None:
+            progress.advance(task_id, 1)
+
+    return current_live_results
+
+def Checker(proxyList, localPortStart, testDomain, timeOut, t2exec, t2kill,
+            checkSpeed=False, speedUrl="", sortBy="ping", speedCfg=None,
+            speedSemaphore=None, maxInternalThreads=50, max_ping_ms=0,
+            progress=None, task_id=None):
+    if CORE_FLAVOR == "mihomo":
+        return Checker_mihomo(
+            proxyList, localPortStart, testDomain, timeOut, t2exec, t2kill,
+            checkSpeed, speedUrl, sortBy, speedCfg, speedSemaphore, maxInternalThreads, max_ping_ms,
+            progress, task_id
+        )
+    return Checker_xray(
+        proxyList, localPortStart, testDomain, timeOut, t2exec, t2kill,
+        checkSpeed, speedUrl, sortBy, speedCfg, speedSemaphore, maxInternalThreads, max_ping_ms,
+        progress, task_id
+    )
+
 def run_logic(args):
-    global CORE_PATH, CTRL_C
+    global CORE_PATH, CORE_FLAVOR, CTRL_C
     
     def signal_handler(sig, frame):
         global CTRL_C
@@ -1579,45 +2335,96 @@ def run_logic(args):
     import signal
     signal.signal(signal.SIGINT, signal_handler)
 
-    CORE_PATH = shutil.which(args.core)
+    requested_engine = str(getattr(args, "engine", GLOBAL_CFG.get("preferred_core", "auto"))).strip().lower()
+    if requested_engine not in ("auto", "xray", "mihomo"):
+        requested_engine = "auto"
+
+    core_arg = (args.core or "").strip()
+    CORE_PATH = ""
+
+    # Если указан кастомный путь/имя ядра через -c, пробуем его первым
+    if core_arg and core_arg.lower() not in ("auto", "xray", "v2ray", "mihomo", "clash-meta"):
+        CORE_PATH = shutil.which(core_arg)
+        if not CORE_PATH and os.path.exists(core_arg):
+            CORE_PATH = os.path.abspath(core_arg)
+
     if not CORE_PATH:
-        # Стандартные места где может лежать ядро
-        candidates = ["xray.exe", "xray", "v2ray.exe", "v2ray", "bin/xray.exe", "bin/xray"]
+        token = core_arg.lower()
+        search_mode = requested_engine
+        if token in ("xray", "v2ray"):
+            search_mode = "xray"
+        elif token in ("mihomo", "clash-meta"):
+            search_mode = "mihomo"
+
+        candidates = build_core_candidates(search_mode)
         for c in candidates:
-             if os.path.exists(c):
-                 CORE_PATH = os.path.abspath(c)
-                 break
+            resolved = shutil.which(c)
+            if resolved:
+                CORE_PATH = resolved
+                break
+            if os.path.exists(c):
+                CORE_PATH = os.path.abspath(c)
+                break
     
     if not CORE_PATH and XRAY_INSTALLER_AVAILABLE:
-        safe_print("[yellow]>> Ядро (xray/v2ray) не найдено, попытка автоустановки...[/]")
+        preferred_core = requested_engine
+        if preferred_core not in ("xray", "mihomo"):
+            preferred_core = str(GLOBAL_CFG.get("preferred_core", "xray")).strip().lower()
+        if preferred_core not in ("xray", "mihomo"):
+            preferred_core = "xray"
+        safe_print(f"[yellow]>> Ядро не найдено, попытка автоустановки ({preferred_core})...[/]")
         try:
-            CORE_PATH = xray_installer.ensure_xray_installed(GLOBAL_CFG)
+            if hasattr(xray_installer, "ensure_core_installed"):
+                CORE_PATH = xray_installer.ensure_core_installed(GLOBAL_CFG, preferred_core=preferred_core)
+            elif preferred_core == "mihomo":
+                safe_print("[yellow]Текущая версия xray_installer.py не умеет ставить mihomo автоматически[/]")
+            else:
+                CORE_PATH = xray_installer.ensure_xray_installed(GLOBAL_CFG)
             
             if CORE_PATH:
-                safe_print(f"[green]✓ Xray установлен: {CORE_PATH}[/]")
+                CORE_FLAVOR = detect_core_flavor(CORE_PATH)
+                core_label = "Mihomo" if CORE_FLAVOR == "mihomo" else "Xray"
+                safe_print(f"[green]✓ {core_label} установлен: {CORE_PATH}[/]")
                 GLOBAL_CFG['core_path'] = CORE_PATH
                 
-                try:
-                    save_cfg = GLOBAL_CFG.copy()
-                    if "sources" in save_cfg: del save_cfg["sources"]
-                    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                        json.dump(save_cfg, f, indent=4)
+                ok, err = save_main_config(GLOBAL_CFG)
+                if ok:
                     safe_print(f"[dim]Путь к ядру сохранён в {CONFIG_FILE}[/]")
-                except Exception as e:
-                    safe_print(f"[yellow]Не удалось сохранить конфиг: {e}[/]")
+                else:
+                    safe_print(f"[yellow]Не удалось сохранить конфиг: {err}[/]")
         except Exception as e:
-            safe_print(f"[red]Ошибка автоустановки Xray: {e}[/]")
+            safe_print(f"[red]Ошибка автоустановки ядра: {e}[/]")
     
     if not CORE_PATH:
-        safe_print(f"[bold red]\\n[ERROR] Ядро (xray/v2ray) не найдено![/]")
-        safe_print(f"[dim]Скачайте вручную: https://github.com/XTLS/Xray-core/releases[/]")
+        safe_print(f"[bold red]\\n[ERROR] Ядро (xray/v2ray/mihomo) не найдено![/]")
+        safe_print(f"[dim]Xray: https://github.com/XTLS/Xray-core/releases[/]")
+        safe_print(f"[dim]Mihomo: https://github.com/MetaCubeX/mihomo/releases[/]")
         return
-        
-    safe_print(f"[dim]Core detected: {CORE_PATH}[/]")
+
+    CORE_FLAVOR = detect_core_flavor(CORE_PATH)
+    if requested_engine != "auto" and CORE_FLAVOR != requested_engine:
+        safe_print(
+            f"[bold red][ERROR] Выбран режим ядра '{requested_engine}', "
+            f"но найдено ядро '{CORE_FLAVOR}': {CORE_PATH}[/]"
+        )
+        if requested_engine == "xray":
+            safe_print("[dim]Укажите путь к xray через --core или установите xray в bin/xray(.exe)[/]")
+        else:
+            safe_print("[dim]Укажите путь к mihomo через --core или установите mihomo в bin/mihomo(.exe)[/]")
+        return
+
+    safe_print(f"[dim]Core detected: {CORE_PATH} ({CORE_FLAVOR})[/]")
+    safe_print(f"[dim]Engine mode: {requested_engine}[/]")
+    if CORE_FLAVOR == "mihomo":
+        safe_print("[yellow]Mihomo mode: проверка идёт по одному прокси на процесс ядра[/]")
 
     safe_print(f"[yellow]>> Очистка зависших процессов ядра...[/]")
     killed_count = 0
-    target_names = [os.path.basename(CORE_PATH).lower(), "xray.exe", "v2ray.exe", "xray", "v2ray"]
+    target_names = [
+        os.path.basename(CORE_PATH).lower(),
+        "xray.exe", "v2ray.exe", "xray", "v2ray",
+        "mihomo.exe", "mihomo", "clash-meta.exe", "clash-meta"
+    ]
     for proc in psutil.process_iter(['pid', 'name']):
         try:
             if proc.info['name'] and proc.info['name'].lower() in target_names:
@@ -1636,9 +2443,26 @@ def run_logic(args):
         if os.path.exists(fpath):
             safe_print(f"[cyan]>> Чтение файла: {fpath}[/]")
             with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
-                parsed, count = parse_content(f.read())
+                file_payload = f.read()
+                parsed, count = parse_content(file_payload)
                 total_found_raw += count
                 lines.update(parsed)
+                safe_print(f"[dim]>> Прямых ссылок в файле: {len(parsed)}[/]")
+
+                sub_urls = extract_subscription_urls(file_payload)
+                if sub_urls:
+                    safe_print(f"[cyan]>> Найдено URL-подписок в файле: {len(sub_urls)}[/]")
+                    before_sub_merge = len(lines)
+                    fetched_sub_total = 0
+                    for sub_url in sub_urls:
+                        links = fetch_url(sub_url)
+                        fetched_sub_total += len(links)
+                        lines.update(links)
+                    added_unique = len(lines) - before_sub_merge
+                    safe_print(
+                        f"[dim]>> Из подписок получено: {fetched_sub_total}, "
+                        f"добавлено уникальных: {added_unique}[/]"
+                    )
 
     if args.url:
         links = fetch_url(args.url)
@@ -1662,15 +2486,25 @@ def run_logic(args):
             parsed, count = parse_content(f.read())
             lines.update(parsed)
 
-    full = list(lines)
+    full = sorted(lines)
+    if args.shuffle:
+        random.shuffle(full)
+    safe_print(f"[dim]>> Уникальных прокси к проверке: {len(full)}[/]")
     if not full:
         safe_print(f"[bold red]Нет прокси для проверки.[/]")
         return
 
-    p_per_batch = GLOBAL_CFG.get("proxies_per_batch", 50)
-    needed_cores = (len(full) + p_per_batch - 1) // p_per_batch
-    threads = min(args.threads, needed_cores)
-    if threads < 1: threads = 1
+    if CORE_FLAVOR == "mihomo":
+        # В mihomo режиме 1 процесс = 1 прокси, поэтому лимитируемся числом прокси.
+        threads = min(args.threads, len(full))
+        if threads < 1:
+            threads = 1
+    else:
+        p_per_batch = GLOBAL_CFG.get("proxies_per_batch", 50)
+        needed_cores = (len(full) + p_per_batch - 1) // p_per_batch
+        threads = min(args.threads, needed_cores)
+        if threads < 1:
+            threads = 1
 
     chunks = list(split_list(full, threads))
     ports = []
@@ -1680,6 +2514,12 @@ def run_logic(args):
         curr_p += len(chunk) + 10 
     
     results = []
+    try:
+        max_ping_ms = int(getattr(args, "max_ping", GLOBAL_CFG.get("max_ping_ms", 0)) or 0)
+    except Exception:
+        max_ping_ms = 0
+    if max_ping_ms < 0:
+        max_ping_ms = 0
     
     speed_config_map = {
         "timeout": GLOBAL_CFG.get("speed_download_timeout", 10),
@@ -1699,7 +2539,13 @@ def run_logic(args):
         TimeRemainingColumn(),
     ]
 
-    console.print(f"\n[magenta]Запуск {threads} ядер (пачек) для {len(full)} прокси...[/]")
+    if CORE_FLAVOR == "mihomo":
+        console.print(f"\n[magenta]Запуск {threads} параллельных воркеров для {len(full)} прокси...[/]")
+        console.print("[dim]Mihomo: 1 процесс = 1 прокси одновременно[/]")
+    else:
+        console.print(f"\n[magenta]Запуск {threads} ядер (пачек) для {len(full)} прокси...[/]")
+    if max_ping_ms > 0:
+        console.print(f"[dim]Фильтр ping: <= {max_ping_ms} ms[/]")
 
     with Progress(*progress_columns, console=console, transient=False) as progress:
         task_id = progress.add_task("[cyan]Checking proxies...", total=len(full))
@@ -1711,7 +2557,7 @@ def run_logic(args):
                     Checker, chunks[i], ports[i], args.domain, args.timeout, 
                     args.t2exec, args.t2kill, args.speed_check, args.speed_test_url, args.sort_by,
                     speed_config_map, speed_semaphore,
-                    GLOBAL_CFG.get("max_internal_threads", 50),
+                    GLOBAL_CFG.get("max_internal_threads", 50), max_ping_ms,
                     progress, task_id
                 )
                 futures.append(ft)
@@ -1791,7 +2637,10 @@ def print_banner():
 
 def kill_all_cores_manual():
     killed_count = 0
-    target_names = ["xray.exe", "v2ray.exe", "xray", "v2ray"]
+    target_names = [
+        "xray.exe", "v2ray.exe", "xray", "v2ray",
+        "mihomo.exe", "mihomo", "clash-meta.exe", "clash-meta"
+    ]
     
     safe_print("[yellow]>> Принудительный сброс ВСЕХ ядер...[/]")
     
@@ -1806,12 +2655,13 @@ def kill_all_cores_manual():
     
     if OS_SYSTEM == "windows":
         try:
-            result = subprocess.run(
-                ["taskkill", "/F", "/IM", "xray.exe", "/T"], 
-                capture_output=True, text=True, timeout=5
-            )
-            if result.returncode == 0:
-                killed_count += result.stdout.count("SUCCESS")
+            for image_name in ("xray.exe", "mihomo.exe"):
+                result = subprocess.run(
+                    ["taskkill", "/F", "/IM", image_name, "/T"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    killed_count += result.stdout.count("SUCCESS")
         except:
             pass
     
@@ -1857,14 +2707,16 @@ def interactive_menu():
         if AGGREGATOR_AVAILABLE:
             table.add_row("4", "Агрегатор", "Скачать базы, объединить и проверить")
         
-        table.add_row("5", "Сброс ядер", "Убить все процессы xray")
+        table.add_row("5", "Сброс ядер", "Убить все процессы xray/mihomo")
         table.add_row("6", "Загрузить лог", "Отправить последние события на paste.rs")
+        table.add_row("7", "Свитч ядра", f"Режим: {GLOBAL_CFG.get('preferred_core', 'auto')}")
+        table.add_row("8", "Порог ping", f"Текущий: {GLOBAL_CFG.get('max_ping_ms', 500)} ms (0 = off)")
         table.add_row("0", "Выход", "Закрыть программу")
         
         console.print(f"[dim]Version: v{__version__}[/]")
         console.print(table)
         
-        valid_choices = ["0", "1", "2", "3", "4", "5", "6"] if AGGREGATOR_AVAILABLE else ["0", "1", "2", "3", "5", "6"]
+        valid_choices = ["0", "1", "2", "3", "4", "5", "6", "7", "8"] if AGGREGATOR_AVAILABLE else ["0", "1", "2", "3", "5", "6", "7", "8"]
         ch = Prompt.ask("[bold yellow]>[/] Выберите действие", choices=valid_choices)
         
         if ch == '0':
@@ -1877,9 +2729,11 @@ def interactive_menu():
             "lport": GLOBAL_CFG['local_port_start'], 
             "threads": GLOBAL_CFG['threads'], 
             "core": GLOBAL_CFG['core_path'], 
+            "engine": GLOBAL_CFG.get("preferred_core", "auto"),
             "t2exec": GLOBAL_CFG['core_startup_timeout'], 
             "t2kill": GLOBAL_CFG['core_kill_delay'], 
             "output": GLOBAL_CFG['output_file'], 
+            "max_ping": GLOBAL_CFG.get("max_ping_ms", 500),
             "shuffle": GLOBAL_CFG['shuffle'], 
             "number": None,
             "direct_list": None,
@@ -1923,6 +2777,43 @@ def interactive_menu():
         elif ch == '6':
             upload_log_to_service()
             Prompt.ask("\nНажмите Enter...", password=False)
+            continue
+        elif ch == '7':
+            new_engine = Prompt.ask(
+                "Режим ядра",
+                choices=["auto", "xray", "mihomo"],
+                default=str(GLOBAL_CFG.get("preferred_core", "auto"))
+            )
+            GLOBAL_CFG["preferred_core"] = new_engine
+            if new_engine == "xray":
+                GLOBAL_CFG["core_path"] = "xray"
+            elif new_engine == "mihomo":
+                GLOBAL_CFG["core_path"] = "mihomo"
+            else:
+                GLOBAL_CFG["core_path"] = "auto"
+
+            ok, err = save_main_config(GLOBAL_CFG)
+            if ok:
+                safe_print(f"[green]✓ Ядро переключено: mode={new_engine}, core_path={GLOBAL_CFG['core_path']}[/]")
+            else:
+                safe_print(f"[yellow]Не удалось сохранить конфиг: {err}[/]")
+            time.sleep(1.0)
+            continue
+        elif ch == '8':
+            raw_ping = Prompt.ask("Максимальный ping (мс), 0 = выключить фильтр", default=str(GLOBAL_CFG.get("max_ping_ms", 500)))
+            try:
+                max_ping = int(raw_ping)
+                if max_ping < 0:
+                    max_ping = 0
+                GLOBAL_CFG["max_ping_ms"] = max_ping
+                ok, err = save_main_config(GLOBAL_CFG)
+                if ok:
+                    safe_print(f"[green]✓ Порог ping сохранён: {max_ping} ms[/]")
+                else:
+                    safe_print(f"[yellow]Не удалось сохранить конфиг: {err}[/]")
+            except Exception:
+                safe_print("[yellow]Некорректное значение ping[/]")
+            time.sleep(1.0)
             continue
         if Confirm.ask("Включить тест скорости?", default=False):
             defaults["speed_check"] = True
@@ -1968,10 +2859,12 @@ def main():
     parser.add_argument("-l", "--lport", type=int, default=GLOBAL_CFG['local_port_start'])
     parser.add_argument("-T", "--threads", type=int, default=GLOBAL_CFG['threads'])
     parser.add_argument("-c", "--core", default=GLOBAL_CFG['core_path'])
+    parser.add_argument("--engine", choices=["auto", "xray", "mihomo"], default=GLOBAL_CFG.get("preferred_core", "auto"), help="Режим выбора ядра: auto/xray/mihomo")
     parser.add_argument("--t2exec", type=float, default=GLOBAL_CFG['core_startup_timeout'])
     parser.add_argument("--t2kill", type=float, default=GLOBAL_CFG['core_kill_delay'])
     parser.add_argument("-o", "--output", default=GLOBAL_CFG['output_file'])
     parser.add_argument("-d", "--domain", default=GLOBAL_CFG['test_domain'])
+    parser.add_argument("--max-ping", type=int, default=GLOBAL_CFG.get("max_ping_ms", 500), dest="max_ping", help="Отсев по ping (мс). 0 = отключить")
     parser.add_argument("-s", "--shuffle", action='store_true', default=GLOBAL_CFG['shuffle'])
     parser.add_argument("-n", "--number", type=int)
     parser.add_argument("--agg", action="store_true", help="Запустить агрегатор")

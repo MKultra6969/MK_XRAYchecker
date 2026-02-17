@@ -1,0 +1,16 @@
+/__pycache__
+all.txt
+all1.txt
+test3.txt
+testlist.txt
+sortedProxy.txt
+geosite.dat
+geoip.dat
+config.json
+checker_history.log
+bin/xray.exe
+sources.json
+bin/mihomo.exe
+/.tmp_state
+/.tmp_runtime
+testsub.txt
