@@ -19,7 +19,7 @@
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
 # +═════════════════════════════════════════════════════════════════════════+
-# ║                           VERSION 1.1.3                                 ║
+# ║                           VERSION 1.1.4                                 ║
 # ║             В случае багов/недочётов создайте issue на github           ║
 # ║                                                                         ║
 # +═════════════════════════════════════════════════════════════════════════+
@@ -60,7 +60,7 @@ YAML_WARNED = False
 
 # ВЕРСИЯ СКРИПТА
 # Формат: MAJOR.MINOR.PATCH (SemVer)
-__version__ = "1.1.3"
+__version__ = "1.1.4"
 
 # --- REALITY / FLOW validation ---
 REALITY_PBK_RE = re.compile(r"^[A-Za-z0-9_-]{43,44}$")   # base64url publicKey
@@ -121,8 +121,9 @@ try:
     import updater
     UPDATER_AVAILABLE = True
     try:
-        if updater.apply_pending_update_if_any():
-            print("[UPDATER] Обновления применены. Перезапустите скрипт для корректной работы.")
+        if os.environ.get("MKXRAY_SKIP_PENDING_APPLY") != "1" and updater.apply_pending_update_if_any():
+            print("[UPDATER] Обновления применены. Перезапуск...")
+            os.execv(sys.executable, [sys.executable] + sys.argv)
     except Exception as e:
         print(f"[UPDATER] Предупреждение: Не удалось применить обновления: {e}")
 except ImportError:
@@ -238,6 +239,8 @@ DEFAULT_CONFIG = {
     "output_file": "sortedProxy.txt", # имя файла с отфильтрованными проксями
     "core_startup_timeout": 2.5, # Максимальное время ожидания старта ядра(ну если тупит)
     "core_kill_delay": 0.05,     # Задержка после УБИЙСТВА
+    "core_cleanup_mode": "owned", # Очистка старых процессов: owned | all | none
+    "router_mode": False,         # Безопасный режим для роутеров/OpenWRT (не трогать чужие процессы)
     "shuffle": False,
     "check_speed": False,
     "sort_by": "ping",           # ping | speed
@@ -296,6 +299,9 @@ DEFAULT_CONFIG = {
 
     # Максимальный ping (мс) для отсева. 0 = не фильтровать по ping.
     "max_ping_ms": 666,
+
+    # Агрегатор: предфильтр по странам (ISO2) до массовой GeoIP-проверки.
+    "agg_countries": [],
 }
 
 def load_sources():
@@ -665,6 +671,11 @@ def detect_core_flavor(core_path):
 
 XRAY_CORE_CANDIDATES = ["xray.exe", "xray", "v2ray.exe", "v2ray", "bin/xray.exe", "bin/xray"]
 MIHOMO_CORE_CANDIDATES = ["mihomo.exe", "mihomo", "clash-meta.exe", "clash-meta", "bin/mihomo.exe", "bin/mihomo"]
+ALL_CORE_PROCESS_NAMES = (
+    "xray.exe", "v2ray.exe", "xray", "v2ray",
+    "mihomo.exe", "mihomo", "clash-meta.exe", "clash-meta"
+)
+VALID_CLEANUP_MODES = {"owned", "all", "none"}
 
 def build_core_candidates(engine_mode):
     mode = str(engine_mode or "auto").strip().lower()
@@ -673,6 +684,75 @@ def build_core_candidates(engine_mode):
     if mode == "mihomo":
         return list(MIHOMO_CORE_CANDIDATES)
     return XRAY_CORE_CANDIDATES + MIHOMO_CORE_CANDIDATES
+
+def normalize_cleanup_mode(mode, default="owned"):
+    normalized = str(mode or default).strip().lower()
+    if normalized not in VALID_CLEANUP_MODES:
+        return default
+    return normalized
+
+def build_core_process_targets(core_path):
+    target_names = set(ALL_CORE_PROCESS_NAMES)
+    core_name = os.path.basename(core_path or "").strip().lower()
+    if core_name:
+        target_names.add(core_name)
+    return target_names
+
+def process_looks_checker_owned(proc):
+    try:
+        cmdline = proc.info.get('cmdline') if hasattr(proc, "info") else None
+        if cmdline is None:
+            cmdline = proc.cmdline()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return False
+    except Exception:
+        return False
+
+    lowered = [str(part).lower() for part in (cmdline or []) if part]
+    if not lowered:
+        return False
+
+    has_batch_cfg = any(
+        ("batch_" in part) and (part.endswith(".json") or part.endswith(".yaml") or part.endswith(".yml"))
+        for part in lowered
+    )
+    if not has_batch_cfg:
+        return False
+
+    temp_markers = {".tmp_runtime", "mkxray_"}
+    temp_tail = os.path.basename(TEMP_DIR).lower()
+    if temp_tail:
+        temp_markers.add(temp_tail)
+
+    return any(any(marker in part for marker in temp_markers) for part in lowered)
+
+def cleanup_stale_cores(core_path, cleanup_mode):
+    mode = normalize_cleanup_mode(cleanup_mode)
+    if mode == "none":
+        return 0, 0, mode
+
+    target_names = build_core_process_targets(core_path)
+    killed_count = 0
+    skipped_foreign = 0
+
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            proc_name = (proc.info.get('name') or "").lower()
+            if not proc_name or proc_name not in target_names:
+                continue
+
+            if mode == "owned" and not process_looks_checker_owned(proc):
+                skipped_foreign += 1
+                continue
+
+            proc.kill()
+            killed_count += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+        except Exception:
+            continue
+
+    return killed_count, skipped_foreign, mode
 
 def save_main_config(cfg):
     try:
@@ -1864,7 +1944,7 @@ def create_batch_config_file(proxy_list, start_port, work_dir):
         return None, None, "No valid proxies"
     
     full_config = {
-        "log": {"loglevel": "warning"},  # warning для диагностики (none скрывает ошибки)
+        "log": {"loglevel": "warning"},
         "inbounds": inbounds,
         "outbounds": outbounds,
         "routing": {
@@ -2329,7 +2409,14 @@ def run_logic(args):
         global CTRL_C
         CTRL_C = True
         safe_print("[bold red]CTRL+C - остановка...[/]")
-        kill_all_cores_manual()
+        signal_router_mode = _bool_value(getattr(args, "router_mode", GLOBAL_CFG.get("router_mode", False)), False)
+        signal_cleanup_mode = normalize_cleanup_mode(
+            getattr(args, "cleanup_mode", GLOBAL_CFG.get("core_cleanup_mode", "owned")),
+            default=normalize_cleanup_mode(GLOBAL_CFG.get("core_cleanup_mode", "owned"))
+        )
+        if signal_router_mode and signal_cleanup_mode == "all":
+            signal_cleanup_mode = "owned"
+        cleanup_stale_cores(CORE_PATH, signal_cleanup_mode)
         sys.exit(0)
 
     import signal
@@ -2338,6 +2425,14 @@ def run_logic(args):
     requested_engine = str(getattr(args, "engine", GLOBAL_CFG.get("preferred_core", "auto"))).strip().lower()
     if requested_engine not in ("auto", "xray", "mihomo"):
         requested_engine = "auto"
+    router_mode = _bool_value(getattr(args, "router_mode", GLOBAL_CFG.get("router_mode", False)), False)
+    cleanup_mode = normalize_cleanup_mode(
+        getattr(args, "cleanup_mode", GLOBAL_CFG.get("core_cleanup_mode", "owned")),
+        default=normalize_cleanup_mode(GLOBAL_CFG.get("core_cleanup_mode", "owned"))
+    )
+    if router_mode and cleanup_mode == "all":
+        safe_print("[yellow]Router mode активен: cleanup mode 'all' переключен на 'owned'[/]")
+        cleanup_mode = "owned"
 
     core_arg = (args.core or "").strip()
     CORE_PATH = ""
@@ -2415,24 +2510,20 @@ def run_logic(args):
 
     safe_print(f"[dim]Core detected: {CORE_PATH} ({CORE_FLAVOR})[/]")
     safe_print(f"[dim]Engine mode: {requested_engine}[/]")
+    if router_mode:
+        safe_print(f"[bold cyan]Router mode: ВКЛ[/] [dim](safe cleanup: {cleanup_mode})[/]")
     if CORE_FLAVOR == "mihomo":
         safe_print("[yellow]Mihomo mode: проверка идёт по одному прокси на процесс ядра[/]")
 
-    safe_print(f"[yellow]>> Очистка зависших процессов ядра...[/]")
-    killed_count = 0
-    target_names = [
-        os.path.basename(CORE_PATH).lower(),
-        "xray.exe", "v2ray.exe", "xray", "v2ray",
-        "mihomo.exe", "mihomo", "clash-meta.exe", "clash-meta"
-    ]
-    for proc in psutil.process_iter(['pid', 'name']):
-        try:
-            if proc.info['name'] and proc.info['name'].lower() in target_names:
-                proc.kill()
-                killed_count += 1
-        except: pass
-    
-    if killed_count > 0: safe_print(f"[green]>> Убито старых процессов: {killed_count}[/]")
+    safe_print(f"[yellow]>> Очистка зависших процессов ядра (mode: {cleanup_mode})...[/]")
+    killed_count, skipped_foreign, effective_mode = cleanup_stale_cores(CORE_PATH, cleanup_mode)
+    if effective_mode == "none":
+        safe_print("[dim]>> Очистка отключена (--cleanup-mode none)[/]")
+    else:
+        if killed_count > 0:
+            safe_print(f"[green]>> Убито старых процессов: {killed_count}[/]")
+        if effective_mode == "owned" and skipped_foreign > 0:
+            safe_print(f"[dim]>> Пропущено чужих процессов: {skipped_foreign}[/]")
     time.sleep(0.5)
     
     lines = set()
@@ -2472,8 +2563,21 @@ def run_logic(args):
         sources_map = GLOBAL_CFG.get("sources", {})
         cats = args.agg_cats if args.agg_cats else list(sources_map.keys())
         kws = args.agg_filter if args.agg_filter else []
+        country_filters = args.agg_country if getattr(args, "agg_country", None) else GLOBAL_CFG.get("agg_countries", [])
+        if isinstance(country_filters, str):
+            country_filters = country_filters.split()
+        country_filters = [str(item).strip() for item in (country_filters or []) if str(item).strip()]
+        if country_filters:
+            safe_print(f"[dim]>> Agg country filter: {' '.join(country_filters)}[/]")
         try:
-            agg_links = aggregator.get_aggregated_links(sources_map, cats, kws, log_func=safe_print, console=console)
+            agg_links = aggregator.get_aggregated_links(
+                sources_map,
+                cats,
+                kws,
+                country_filters=country_filters,
+                log_func=safe_print,
+                console=console
+            )
             lines.update(agg_links)
         except: pass
 
@@ -2637,10 +2741,7 @@ def print_banner():
 
 def kill_all_cores_manual():
     killed_count = 0
-    target_names = [
-        "xray.exe", "v2ray.exe", "xray", "v2ray",
-        "mihomo.exe", "mihomo", "clash-meta.exe", "clash-meta"
-    ]
+    target_names = list(ALL_CORE_PROCESS_NAMES)
     
     safe_print("[yellow]>> Принудительный сброс ВСЕХ ядер...[/]")
     
@@ -2714,6 +2815,9 @@ def interactive_menu():
         table.add_row("0", "Выход", "Закрыть программу")
         
         console.print(f"[dim]Version: v{__version__}[/]")
+        router_state = "ON" if _bool_value(GLOBAL_CFG.get("router_mode", False), False) else "OFF"
+        cleanup_state = normalize_cleanup_mode(GLOBAL_CFG.get("core_cleanup_mode", "owned"))
+        console.print(f"[dim]Router mode: {router_state} | Cleanup mode: {cleanup_state}[/]")
         console.print(table)
         
         valid_choices = ["0", "1", "2", "3", "4", "5", "6", "7", "8"] if AGGREGATOR_AVAILABLE else ["0", "1", "2", "3", "5", "6", "7", "8"]
@@ -2721,6 +2825,10 @@ def interactive_menu():
         
         if ch == '0':
             sys.exit()
+
+        cfg_agg_countries = GLOBAL_CFG.get("agg_countries", [])
+        if isinstance(cfg_agg_countries, str):
+            cfg_agg_countries = cfg_agg_countries.split()
 
         defaults = {
             "file": None, "url": None, "reuse": False,
@@ -2730,6 +2838,8 @@ def interactive_menu():
             "threads": GLOBAL_CFG['threads'], 
             "core": GLOBAL_CFG['core_path'], 
             "engine": GLOBAL_CFG.get("preferred_core", "auto"),
+            "router_mode": _bool_value(GLOBAL_CFG.get("router_mode", False), False),
+            "cleanup_mode": normalize_cleanup_mode(GLOBAL_CFG.get("core_cleanup_mode", "owned")),
             "t2exec": GLOBAL_CFG['core_startup_timeout'], 
             "t2kill": GLOBAL_CFG['core_kill_delay'], 
             "output": GLOBAL_CFG['output_file'], 
@@ -2737,6 +2847,7 @@ def interactive_menu():
             "shuffle": GLOBAL_CFG['shuffle'], 
             "number": None,
             "direct_list": None,
+            "agg_country": list(cfg_agg_countries),
             "speed_check": GLOBAL_CFG['check_speed'],
             "speed_test_url": GLOBAL_CFG['speed_test_url'],
             "sort_by": GLOBAL_CFG['sort_by'],
@@ -2758,10 +2869,22 @@ def interactive_menu():
             console.print(Panel(f"Доступные категории: [green]{', '.join(GLOBAL_CFG.get('sources', {}).keys())}[/]", title="Агрегатор"))
             cats = Prompt.ask("Введите категории (через пробел)", default="1 2").split()
             kws = Prompt.ask("Фильтр (ключевые слова через пробел)", default="").split()
+            country_default = " ".join(cfg_agg_countries)
+            country_filters = Prompt.ask(
+                "Фильтр стран ISO2 (через пробел, опционально)",
+                default=country_default
+            ).split()
+            defaults["agg_country"] = country_filters
             
             sources_map = GLOBAL_CFG.get("sources", {})
             try:
-                raw_links = aggregator.get_aggregated_links(sources_map, cats, kws, console=console)
+                raw_links = aggregator.get_aggregated_links(
+                    sources_map,
+                    cats,
+                    kws,
+                    country_filters=country_filters,
+                    console=console
+                )
                 if not raw_links:
                     safe_print("[bold red]Ничего не найдено агрегатором.[/]")
                     time.sleep(2)
@@ -2843,11 +2966,16 @@ def interactive_menu():
         Prompt.ask("\n[bold]Нажмите Enter чтобы вернуться в меню...[/]", password=False)
 
 def main():
-    if UPDATER_AVAILABLE:
+    skip_self_update = ("--no-update" in sys.argv) or (os.environ.get("MKXRAY_SKIP_SELF_UPDATE") == "1")
+    if UPDATER_AVAILABLE and not skip_self_update:
         try:
             updater.maybe_self_update(GLOBAL_CFG)
         except Exception as e:
             safe_print(f"[yellow]Предупреждение: Ошибка проверки обновлений: {e}[/]")
+
+    agg_country_default = GLOBAL_CFG.get("agg_countries", [])
+    if isinstance(agg_country_default, str):
+        agg_country_default = agg_country_default.split()
     
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--menu", action="store_true")
@@ -2860,6 +2988,8 @@ def main():
     parser.add_argument("-T", "--threads", type=int, default=GLOBAL_CFG['threads'])
     parser.add_argument("-c", "--core", default=GLOBAL_CFG['core_path'])
     parser.add_argument("--engine", choices=["auto", "xray", "mihomo"], default=GLOBAL_CFG.get("preferred_core", "auto"), help="Режим выбора ядра: auto/xray/mihomo")
+    parser.add_argument("--router-mode", action="store_true", default=_bool_value(GLOBAL_CFG.get("router_mode", False), False), help="Безопасный режим для роутеров/OpenWRT (не убивать чужие ядра)")
+    parser.add_argument("--cleanup-mode", choices=["owned", "all", "none"], default=normalize_cleanup_mode(GLOBAL_CFG.get("core_cleanup_mode", "owned")), help="Очистка старых процессов ядра: owned/all/none")
     parser.add_argument("--t2exec", type=float, default=GLOBAL_CFG['core_startup_timeout'])
     parser.add_argument("--t2kill", type=float, default=GLOBAL_CFG['core_kill_delay'])
     parser.add_argument("-o", "--output", default=GLOBAL_CFG['output_file'])
@@ -2870,6 +3000,7 @@ def main():
     parser.add_argument("--agg", action="store_true", help="Запустить агрегатор")
     parser.add_argument("--agg-cats", nargs='+', help="Категории для агрегатора (например: 1 2)")
     parser.add_argument("--agg-filter", nargs='+', help="Ключевые слова для фильтра (например: vless reality)")
+    parser.add_argument("--agg-country", nargs='+', default=agg_country_default, help="Фильтр агрегатора по странам ISO2 (например: RU DE GB)")
     parser.add_argument("--speed", action="store_true", dest="speed_check", help="Включить тест скорости")
     parser.add_argument("--sort", choices=["ping", "speed"], default=GLOBAL_CFG['sort_by'], dest="sort_by", help="Метод сортировки")
     parser.add_argument("--speed-url", default=GLOBAL_CFG['speed_test_url'], dest="speed_test_url")
@@ -2927,3 +3058,5 @@ if __name__ == '__main__':
 # +═════════════════════════════════════════════════════════════════════════+
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
+
+# мяу мяу мяу мяу мяу мяу мяу
