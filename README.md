@@ -8,7 +8,7 @@
 
 <p>
   <a href="https://github.com/MKultra6969/MK_XRAYchecker">
-    <img src="https://img.shields.io/badge/VERSION-1.1.3-magenta?style=for-the-badge&logo=python" alt="Version">
+    <img src="https://img.shields.io/badge/VERSION-1.1.4-magenta?style=for-the-badge&logo=python" alt="Version">
   </a>
   <a href="http://www.wtfpl.net/">
     <img src="https://img.shields.io/badge/LICENSE-WTFPL-red?style=for-the-badge" alt="License">
@@ -18,8 +18,8 @@
   </a>
 </p>
 
-<img width="1453" height="744" alt="Main menu" src="https://github.com/user-attachments/assets/7e59a198-b656-4214-acc7-5058f37fdc84" />
-Главное меню v1.1.3
+<img width="1463" height="773" alt="main menu" src="https://github.com/user-attachments/assets/b9ec5b8b-45e1-4e98-b0c8-cf06cd990881" />
+Главное меню v1.1.4
 
 
 </div>
@@ -138,8 +138,11 @@ python v2rayChecker.py --no-update
 - `autoinstall_mihomo`: `true|false` — автоустановка `mihomo` при отсутствии.
 - `mihomo_version`: `"latest"` или конкретный тег.
 - `preferred_core`: `"auto"` / `"xray"` / `"mihomo"` — режим выбора ядра.
+- `router_mode`: `true/false` — безопасный режим для роутеров/OpenWRT.
+- `core_cleanup_mode`: `"owned"` / `"all"` / `"none"` — политика очистки старых процессов ядра.
 - `max_ping_ms`: порог ping в миллисекундах для отсева (`0` = отключено).
 - `core_path`: путь к ядру (например `xray`, `bin/xray`, `bin/mihomo`).
+- `agg_countries`: список ISO2-кодов стран для предфильтра агрегатора (например `["RU","DE","GB"]`).
 
 ---
 
@@ -173,18 +176,21 @@ python v2rayChecker.py -f "proxies.txt" --debug
 | :--- | :--- |
 | `-m`, `--menu` | Принудительный запуск интерактивного меню |
 | `-f`, `--file` | Путь к `.txt` с прокси или со списком URL-подписок |
-| `-u`, `--url` | URL ссылка на подписку или список |
+| `-u`, `--url` | URL ссылка на подписку или список (v1.1.3)|
 | `--agg` | Запустить встроенный агрегатор (граббер) прокси |
 | `--agg-cats` | Категории источников для агрегатора (например: `1 2`) |
 | `--agg-filter` | Фильтр агрегатора по ключевым словам (например: `vless reality`) |
+| `--agg-country` | Фильтр агрегатора по странам ISO2 (например: `RU DE GB`) (v1.1.4)|
 | `-o`, `--output` | Файл для сохранения рабочих проксей (по дефолту: `sortedProxy.txt`) |
 | `-T`, `--threads` | Лимит одновременно запущенных **ядер** (пачек). |
 | `-t`, `--timeout` | Таймаут ожидания ответа в секундах (по дефолту: 3) |
 | `-l`, `--lport` | Стартовый локальный порт для ядер (по дефолту: 1080) |
 | `-c`, `--core` | Путь к исполняемому файлу ядра (`xray`/`v2ray`/`mihomo`) |
 | `--engine` | Режим выбора ядра: `auto` / `xray` / `mihomo` |
+| `--router-mode` | Безопасный режим роутера (не убивать чужие процессы ядер) (v1.1.4)|
+| `--cleanup-mode` | Очистка старых процессов: `owned` / `all` / `none` (v1.1.4)|
 | `-d`, `--domain` | Тестовый домен для проверки подключения (по дефолту: Google/CF generate_204) |
-| `--max-ping` | Отсев по ping (мс), `0` = отключить |
+| `--max-ping` | Отсев по ping (мс), `0` = отключить (v1.1.3)|
 | `-n`, `--number` | Ограничить количество проверяемых прокси (взять первые N) |
 | `--reuse` | Перепроверить файл результатов (`sortedProxy.txt`) |
 | `-s`, `--shuffle` | Перемешать список перед проверкой |
