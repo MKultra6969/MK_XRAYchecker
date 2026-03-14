@@ -18,8 +18,8 @@
   </a>
 </p>
 
-<img width="1463" height="773" alt="main menu" src="https://github.com/user-attachments/assets/b9ec5b8b-45e1-4e98-b0c8-cf06cd990881" />
-Главное меню
+![Главное меню](https://raw.githubusercontent.com/MKultra6969/MK_XRAYchecker/main/menuShowcase/1.3.0.png)
+Главное меню v1.3.0
 
 
 </div>
