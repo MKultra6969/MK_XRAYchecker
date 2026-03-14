@@ -2,6 +2,45 @@
 
 Почти все изменения проекта будут документироваться в этом файле.
 
+## [1.3.0] - 03-14-2026
+
+### Added
+- Локальный helper-модуль `mtproto_faketls.py` для поддержки `ee/FakeTLS` MTProxy без внешнего runtime-wrapper.
+- Новый параметр `dc_probe_limit` в блоке `mtproto` для ограничения числа лучших Telegram DC, которые checker перебирает для одного прокси.
+- Файл `VERSION` в корне репозитория для fallback-проверки версии через raw GitHub, если Releases API недоступен.
+
+### Changed
+- MTProto probe теперь подбирает transport в зависимости от типа секрета (`standard`, `dd`, `ee/FakeTLS`) и перебирает несколько наиболее близких Telegram DC вместо жёсткого фиксированного `dc2`.
+- MTProto итоговый вывод теперь разделяет результаты на `LIVE / CONN / DROP / FAIL`, чтобы медленные и частично рабочие прокси не считались одинаковыми ошибками.
+- Интерактивное меню переделано в двухуровневый интерфейс: отдельные разделы `Проверка / Настройки / Сервис`, плюс компактная панель текущего состояния.
+- Автообновление теперь отслеживает и валидирует новые MTProto-модули через расширенный smoke-check после staged update.
+- README обновлён под двухуровневое меню, улучшенный MTProto probe и поведение ping-фильтра.
+
+### Fixed
+- Исправлена обработка `dd` MTProxy secrets, из-за которой живые ссылки ошибочно отбрасывались на парсинге.
+- Убран шум `Connecting/Disconnecting`, прогресс MTProto перестал ломаться сторонними логами, а хвост `Future exception was never retrieved` больше не засоряет консоль.
+- Флаги `--speed` и `--sort speed` для `--mtproto` больше не игнорируются молча: checker явно предупреждает и переключается обратно на ping.
+- Smoke-check updater-а больше не считает обновление успешным, если `Telethon` не импортируется и MTProto режим всё равно был бы нерабочим.
+
+## [1.2.0] - 03-14-2026
+
+### Added
+- Отдельный `MTProto checker` для Telegram proxy (`tg://proxy`, `t.me/proxy`) в новом модуле `mtproto_checker.py`.
+- Новый CLI-флаг `--mtproto` для запуска отдельного MTProto режима без участия `xray/mihomo`.
+- Новый блок `mtproto` в `config.json`: `enabled`, `api_id`, `api_hash`, `threads`, `timeout`, `max_ping_ms`, `output_file`.
+- Новый пункт `MTProto` в интерактивном меню и отдельная настройка `MTProto ping`.
+- Self-test для MTProto parser через `--self-test`.
+- Новая зависимость `telethon` в `requirements.txt`.
+
+### Changed
+- Логика MTProto вынесена в отдельный backend и orchestration path внутри `v2rayChecker.py`, не смешиваясь с текущим Xray/Mihomo pipeline.
+- Для существующих конфигов включено автоматическое дозаполнение новых nested-ключей в `config.json`.
+- `--self-test` и автообновление конфига переведены на ASCII-safe вывод, чтобы не падать в Windows-консолях с `cp1252`.
+- README обновлён под новый отдельный MTProto режим, отдельный output-файл и требования к `api_id/api_hash`.
+
+### Fixed
+- Исправлен сбой `--self-test` и первого запуска после обновления конфига в окружениях с ограниченной консольной кодировкой Windows.
+
 ## [1.1.4] - 02-21-2026
 
 ### Added

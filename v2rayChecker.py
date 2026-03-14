@@ -19,13 +19,14 @@
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
 # +═════════════════════════════════════════════════════════════════════════+
-# ║                           VERSION 1.1.4                                 ║
+# ║                           VERSION 1.3.0                                 ║
 # ║             В случае багов/недочётов создайте issue на github           ║
 # ║                                                                         ║
 # +═════════════════════════════════════════════════════════════════════════+
 
 
 import argparse
+import copy
 import tempfile
 import sys
 import os
@@ -60,7 +61,21 @@ YAML_WARNED = False
 
 # ВЕРСИЯ СКРИПТА
 # Формат: MAJOR.MINOR.PATCH (SemVer)
-__version__ = "1.1.4"
+__version__ = "1.3.0"
+
+
+def _ensure_utf8_stdio():
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_ensure_utf8_stdio()
 
 # --- REALITY / FLOW validation ---
 REALITY_PBK_RE = re.compile(r"^[A-Za-z0-9_-]{43,44}$")   # base64url publicKey
@@ -115,6 +130,14 @@ try:
     AGGREGATOR_AVAILABLE = True
 except ImportError:
     AGGREGATOR_AVAILABLE = False
+
+# --- MTProto Checker Module ---
+try:
+    import mtproto_checker
+    MTPROTO_AVAILABLE = True
+except ImportError:
+    mtproto_checker = None
+    MTPROTO_AVAILABLE = False
 
 # --- Self-Update Module ---
 try:
@@ -302,7 +325,58 @@ DEFAULT_CONFIG = {
 
     # Агрегатор: предфильтр по странам (ISO2) до массовой GeoIP-проверки.
     "agg_countries": [],
+
+    # MTProto checker: отдельный режим для Telegram proxy (tg://proxy / t.me/proxy)
+    "mtproto": {
+        "enabled": True,
+        "api_id": 0,
+        "api_hash": "",
+        "threads": 20,
+        "timeout": 5,
+        "max_ping_ms": 666,
+        "dc_probe_limit": 3,
+        "output_file": "sortedMtproto.txt"
+    }
 }
+
+
+def _merge_with_defaults(defaults, user_data):
+    result = copy.deepcopy(defaults)
+    missing_keys = False
+
+    if not isinstance(user_data, dict):
+        return result, True
+
+    for key, default_value in defaults.items():
+        if key not in user_data:
+            missing_keys = True
+            continue
+
+        user_value = user_data.get(key)
+        if isinstance(default_value, dict):
+            if isinstance(user_value, dict):
+                merged_value, nested_missing = _merge_with_defaults(default_value, user_value)
+                result[key] = merged_value
+                if nested_missing:
+                    missing_keys = True
+            else:
+                missing_keys = True
+        else:
+            result[key] = user_value
+
+    for key, user_value in user_data.items():
+        if key not in defaults:
+            result[key] = user_value
+
+    return result, missing_keys
+
+
+def get_mtproto_config(cfg=None):
+    source = cfg if isinstance(cfg, dict) else GLOBAL_CFG
+    base = copy.deepcopy(DEFAULT_CONFIG.get("mtproto", {}))
+    user_value = source.get("mtproto", {}) if isinstance(source, dict) else {}
+    merged, _ = _merge_with_defaults(base, user_value)
+    return merged
 
 def load_sources():
     if os.path.exists(SOURCES_FILE):
@@ -328,14 +402,14 @@ def load_config():
 
     if not os.path.exists(CONFIG_FILE):
         try:
-            config_to_write = DEFAULT_CONFIG.copy()
+            config_to_write = copy.deepcopy(DEFAULT_CONFIG)
             del config_to_write["sources"] 
             
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(config_to_write, f, indent=4)
             print(f"Created default {CONFIG_FILE}")
         except: pass
-        cfg = DEFAULT_CONFIG.copy()
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
         cfg["sources"] = loaded_sources
         return cfg
     
@@ -343,23 +417,14 @@ def load_config():
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             user_config = json.load(f)
         
-        config = DEFAULT_CONFIG.copy()
-        config.update(user_config)
+        config, has_new_keys = _merge_with_defaults(DEFAULT_CONFIG, user_config)
         
         config["sources"] = loaded_sources
         
-        has_new_keys = False
-        keys_to_check = [k for k in DEFAULT_CONFIG.keys() if k != "sources"]
-        
-        for key in keys_to_check:
-            if key not in user_config:
-                has_new_keys = True
-                break
-        
         if has_new_keys:
             try:
-                print(f">> Обновление {CONFIG_FILE}: добавлены новые параметры...")
-                save_cfg = config.copy()
+                print(f">> Config update: added new keys to {CONFIG_FILE}...")
+                save_cfg = copy.deepcopy(config)
                 if "sources" in save_cfg: del save_cfg["sources"]
                 
                 with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
@@ -370,7 +435,7 @@ def load_config():
         return config
     except Exception as e:
         print(f"Error loading config: {e}")
-        cfg = DEFAULT_CONFIG.copy()
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
         cfg["sources"] = loaded_sources
         return cfg
 
@@ -460,9 +525,9 @@ def _self_test_clean_url():
             has_separate_keys = "security" in params or "pbk" in params or "flow" in params
             if has_separate_keys or expected in cleaned:
                 passed += 1
-                safe_print(f"[green]✓ PASS[/]: {raw[:60]}...")
+                safe_print(f"[green]PASS[/]: {raw[:60]}...")
             else:
-                safe_print(f"[red]✗ FAIL[/]: {raw[:60]}...")
+                safe_print(f"[red]FAIL[/]: {raw[:60]}...")
                 safe_print(f"[dim]  Got: {cleaned[:100]}[/]")
         else:
             passed += 1
@@ -2402,8 +2467,239 @@ def Checker(proxyList, localPortStart, testDomain, timeOut, t2exec, t2kill,
         progress, task_id
     )
 
+
+def _arg_was_provided(*flags):
+    argv = sys.argv[1:]
+    for flag in flags:
+        if flag in argv:
+            return True
+        prefix = f"{flag}="
+        if any(arg.startswith(prefix) for arg in argv):
+            return True
+    return False
+
+
+def apply_mtproto_arg_defaults(args):
+    if not getattr(args, "mtproto", False):
+        return args
+
+    mt_cfg = get_mtproto_config(GLOBAL_CFG)
+    mtproto_speed_requested = False
+    if _arg_was_provided("--speed"):
+        mtproto_speed_requested = True
+    elif _arg_was_provided("--sort") and str(getattr(args, "sort_by", "ping")).strip().lower() == "speed":
+        mtproto_speed_requested = True
+
+    args.mtproto_speed_flag_used = mtproto_speed_requested
+
+    if not _arg_was_provided("-o", "--output"):
+        args.output = mt_cfg.get("output_file", "sortedMtproto.txt")
+    if not _arg_was_provided("-T", "--threads"):
+        args.threads = int(mt_cfg.get("threads", 20) or 20)
+    if not _arg_was_provided("-t", "--timeout"):
+        args.timeout = int(mt_cfg.get("timeout", 5) or 5)
+    if not _arg_was_provided("--max-ping"):
+        args.max_ping = int(mt_cfg.get("max_ping_ms", 0) or 0)
+
+    args.sort_by = "ping"
+    args.speed_check = False
+    return args
+
+
+def build_mtproto_runtime_cfg(args):
+    runtime_cfg = get_mtproto_config(GLOBAL_CFG)
+    runtime_cfg["threads"] = max(1, int(getattr(args, "threads", runtime_cfg.get("threads", 20)) or 1))
+    runtime_cfg["timeout"] = max(1, int(getattr(args, "timeout", runtime_cfg.get("timeout", 5)) or 1))
+    runtime_cfg["max_ping_ms"] = max(0, int(getattr(args, "max_ping", runtime_cfg.get("max_ping_ms", 0)) or 0))
+    runtime_cfg["dc_probe_limit"] = max(1, int(runtime_cfg.get("dc_probe_limit", 3) or 3))
+    runtime_cfg["output_file"] = str(getattr(args, "output", runtime_cfg.get("output_file", "sortedMtproto.txt")) or runtime_cfg.get("output_file", "sortedMtproto.txt"))
+    return runtime_cfg
+
+
+def _merge_mtproto_entries(target_map, entries):
+    before = len(target_map)
+    for entry in entries:
+        if not entry:
+            continue
+        target_map.setdefault(entry["unique_key"], entry)
+    return len(target_map) - before
+
+
+def run_mtproto_logic(args):
+    if not MTPROTO_AVAILABLE or mtproto_checker is None:
+        safe_print("[bold red]MTProto checker module не найден.[/]")
+        return
+
+    runtime_cfg = build_mtproto_runtime_cfg(args)
+    if not _bool_value(runtime_cfg.get("enabled", True), True):
+        safe_print("[yellow]MTProto checker отключён в config.json (mtproto.enabled = false)[/]")
+        return
+
+    if getattr(args, "mtproto_speed_flag_used", False):
+        safe_print("[yellow]MTProto mode: speed test и sort=speed не поддерживаются, используется сортировка только по ping[/]")
+
+    ok, err = mtproto_checker.validate_runtime_config(runtime_cfg)
+    if not ok:
+        safe_print(f"[bold red]MTProto config error:[/] {err}")
+        return
+
+    entries_map = {}
+
+    if args.file:
+        fpath = args.file.strip('"')
+        if os.path.exists(fpath):
+            safe_print(f"[cyan]>> Чтение MTProto файла: {fpath}[/]")
+            with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                file_payload = f.read()
+            parsed_entries, raw_hits, invalid_count = mtproto_checker.parse_mtproto_content(file_payload)
+            added_unique = _merge_mtproto_entries(entries_map, parsed_entries)
+            safe_print(
+                f"[dim]>> MTProto ссылок в файле: {raw_hits}, "
+                f"invalid: {invalid_count}, добавлено уникальных: {added_unique}[/]"
+            )
+        else:
+            safe_print(f"[bold red]Файл не найден: {fpath}[/]")
+            return
+
+    if args.url:
+        raw_url = args.url.strip()
+        if mtproto_checker.is_mtproto_link(raw_url):
+            parsed_entry, parse_error = mtproto_checker.parse_mtproto_url(raw_url)
+            if not parsed_entry:
+                safe_print(f"[bold red]Некорректная MTProto ссылка:[/] {parse_error}")
+                return
+            added_unique = _merge_mtproto_entries(entries_map, [parsed_entry])
+            safe_print(f"[dim]>> Прямая MTProto ссылка добавлена: {added_unique}[/]")
+        else:
+            try:
+                parsed_entries, raw_hits, invalid_count = mtproto_checker.fetch_mtproto_entries(
+                    raw_url,
+                    timeout=max(int(runtime_cfg.get("timeout", 5)), 5),
+                    log_func=safe_print
+                )
+                added_unique = _merge_mtproto_entries(entries_map, parsed_entries)
+                safe_print(
+                    f"[dim]>> Из URL получено MTProto ссылок: {raw_hits}, "
+                    f"invalid: {invalid_count}, добавлено уникальных: {added_unique}[/]"
+                )
+            except Exception as e:
+                safe_print(f"[bold red]Ошибка загрузки MTProto URL:[/] {e}")
+                return
+
+    if getattr(args, "reuse", False):
+        reuse_path = runtime_cfg["output_file"]
+        if os.path.exists(reuse_path):
+            with open(reuse_path, 'r', encoding='utf-8', errors='ignore') as f:
+                parsed_entries, raw_hits, invalid_count = mtproto_checker.parse_mtproto_content(f.read())
+            added_unique = _merge_mtproto_entries(entries_map, parsed_entries)
+            safe_print(
+                f"[dim]>> Reuse MTProto: {raw_hits}, invalid: {invalid_count}, "
+                f"добавлено уникальных: {added_unique}[/]"
+            )
+        else:
+            safe_print(f"[yellow]Reuse-файл не найден: {reuse_path}[/]")
+
+    full = list(entries_map.values())
+    if getattr(args, "shuffle", False):
+        random.shuffle(full)
+
+    if getattr(args, "number", None):
+        try:
+            limit = int(args.number)
+            if limit > 0:
+                full = full[:limit]
+        except Exception:
+            pass
+
+    safe_print(f"[dim]>> Уникальных MTProto прокси к проверке: {len(full)}[/]")
+    if not full:
+        safe_print("[bold red]Нет MTProto прокси для проверки.[/]")
+        return
+
+    dc_candidates = mtproto_checker.rank_telegram_dcs(limit=int(runtime_cfg.get("dc_probe_limit", 3) or 3))
+    runtime_cfg["dc_candidates"] = dc_candidates
+
+    runtime_cfg["threads"] = min(int(runtime_cfg.get("threads", 1) or 1), len(full))
+    if runtime_cfg["threads"] < 1:
+        runtime_cfg["threads"] = 1
+
+    progress_columns = [
+        SpinnerColumn(style="bold yellow"),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=40, style="dim", complete_style="green", finished_style="bold green"),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+    ]
+
+    console.print(
+        f"\n[magenta]Запуск {runtime_cfg['threads']} MTProto воркеров "
+        f"для {len(full)} прокси...[/]"
+    )
+    if dc_candidates:
+        dc_desc = ", ".join(
+            f"dc{item['dc_id']}"
+            + (f"({item['probe_ms']}ms)" if item.get("probe_ms") is not None else "")
+            for item in dc_candidates
+        )
+        console.print(f"[dim]MTProto DC order: {dc_desc}[/]")
+    if runtime_cfg.get("max_ping_ms", 0) > 0:
+        console.print(f"[dim]Фильтр ping MTProto: <= {runtime_cfg['max_ping_ms']} ms[/]")
+
+    mtproto_log_buffer = []
+    with Progress(*progress_columns, console=console, transient=False) as progress:
+        task_id = progress.add_task("[cyan]Checking MTProto proxies...", total=len(full))
+        results, all_results = mtproto_checker.run_mtproto_check(
+            full,
+            runtime_cfg,
+            log_func=mtproto_log_buffer.append,
+            progress_callback=lambda: progress.advance(task_id, 1)
+        )
+
+    for log_line in mtproto_log_buffer:
+        safe_print(log_line)
+
+    results.sort(key=lambda x: x[1])
+
+    with open(runtime_cfg["output_file"], 'w', encoding='utf-8') as f:
+        for item in results:
+            f.write(item[0] + '\n')
+
+    if results:
+        table = Table(title=f"MTProto Results (Топ 15 из {len(results)})", box=box.ROUNDED)
+        table.add_column("Ping", justify="right", style="green")
+        table.add_column("Server", justify="left", overflow="fold")
+
+        for item in results[:15]:
+            parsed_entry, _ = mtproto_checker.parse_mtproto_url(item[0])
+            label = parsed_entry["label"] if parsed_entry else "mtproto"
+            if len(label) > 50:
+                label = label[:47] + "..."
+            table.add_row(f"{item[1]} ms", label)
+        console.print(table)
+
+    live_count = len([item for item in all_results if item.get("status") == "live"])
+    connect_only_count = len([item for item in all_results if item.get("status") == "connect_only"])
+    drop_count = len([item for item in all_results if item.get("status") == "drop"])
+    failed_count = len([item for item in all_results if item.get("status") == "fail"])
+    safe_print(
+        f"\n[bold green]MTProto готово! LIVE: {live_count}. "
+        f"CONN: {connect_only_count}. DROP: {drop_count}. FAIL: {failed_count}. "
+        f"Результат в: {runtime_cfg['output_file']}[/]"
+    )
+    if runtime_cfg.get("max_ping_ms", 0) > 0 and drop_count > 0:
+        safe_print(
+            f"[yellow]Подсказка:[/] {drop_count} MTProto proxy живы, но отфильтрованы по ping > "
+            f"{runtime_cfg['max_ping_ms']} ms. Для проверки именно живых прокси поставь `MTProto ping = 0`."
+        )
+
 def run_logic(args):
     global CORE_PATH, CORE_FLAVOR, CTRL_C
+
+    if getattr(args, "mtproto", False):
+        run_mtproto_logic(args)
+        return
     
     def signal_handler(sig, frame):
         global CTRL_C
@@ -2792,178 +3088,305 @@ def kill_all_cores_manual():
     else:
         safe_print("[bold green]✅ Все чисто![/]")
 
+def _render_interactive_status(mt_cfg):
+    router_state = "ON" if _bool_value(GLOBAL_CFG.get("router_mode", False), False) else "OFF"
+    cleanup_state = normalize_cleanup_mode(GLOBAL_CFG.get("core_cleanup_mode", "owned"))
+
+    status_grid = Table.grid(expand=True, padding=(0, 1))
+    status_grid.add_column(style="cyan", justify="right", width=18)
+    status_grid.add_column(style="white")
+    status_grid.add_row("Version", f"v{__version__}")
+    status_grid.add_row("Ядро", str(GLOBAL_CFG.get("preferred_core", "auto")))
+    status_grid.add_row(
+        "Ping",
+        f"Xray/Mihomo: {GLOBAL_CFG.get('max_ping_ms', 500)} ms | "
+        f"MTProto: {mt_cfg.get('max_ping_ms', 0)} ms"
+    )
+    status_grid.add_row("Router/Cleanup", f"{router_state} / {cleanup_state}")
+    status_grid.add_row(
+        "Output",
+        f"{GLOBAL_CFG.get('output_file', 'sortedProxy.txt')} | "
+        f"{mt_cfg.get('output_file', 'sortedMtproto.txt')}"
+    )
+    console.print(Panel(status_grid, title="Текущее состояние", border_style="dim"))
+
+
+def _render_interactive_menu(title, rows, subtitle=None):
+    try:
+        console.clear()
+    except Exception:
+        pass
+
+    print_banner()
+    mt_cfg = get_mtproto_config(GLOBAL_CFG)
+    _render_interactive_status(mt_cfg)
+
+    table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED, expand=True, title=title)
+    table.add_column("№", style="cyan", width=4, justify="center")
+    table.add_column("Действие", style="white", ratio=2, no_wrap=True)
+    table.add_column("Описание", style="dim", ratio=5)
+
+    for key, action, description in rows:
+        table.add_row(str(key), action, description)
+
+    console.print(table)
+    if subtitle:
+        console.print(f"[dim]{subtitle}[/]")
+
+    return Prompt.ask("[bold yellow]>[/] Выберите действие", choices=[str(row[0]) for row in rows])
+
+
+def _build_interactive_defaults():
+    cfg_agg_countries = GLOBAL_CFG.get("agg_countries", [])
+    if isinstance(cfg_agg_countries, str):
+        cfg_agg_countries = cfg_agg_countries.split()
+
+    return {
+        "file": None, "url": None, "reuse": False,
+        "domain": GLOBAL_CFG['test_domain'],
+        "timeout": GLOBAL_CFG['timeout'],
+        "lport": GLOBAL_CFG['local_port_start'],
+        "threads": GLOBAL_CFG['threads'],
+        "core": GLOBAL_CFG['core_path'],
+        "engine": GLOBAL_CFG.get("preferred_core", "auto"),
+        "router_mode": _bool_value(GLOBAL_CFG.get("router_mode", False), False),
+        "cleanup_mode": normalize_cleanup_mode(GLOBAL_CFG.get("core_cleanup_mode", "owned")),
+        "t2exec": GLOBAL_CFG['core_startup_timeout'],
+        "t2kill": GLOBAL_CFG['core_kill_delay'],
+        "output": GLOBAL_CFG['output_file'],
+        "max_ping": GLOBAL_CFG.get("max_ping_ms", 500),
+        "shuffle": GLOBAL_CFG['shuffle'],
+        "number": None,
+        "direct_list": None,
+        "agg_country": list(cfg_agg_countries),
+        "speed_check": GLOBAL_CFG['check_speed'],
+        "speed_test_url": GLOBAL_CFG['speed_test_url'],
+        "sort_by": GLOBAL_CFG['sort_by'],
+        "menu": True,
+        "mtproto": False
+    }
+
+
+def _run_interactive_args(defaults):
+    if not defaults.get("mtproto") and Confirm.ask("Включить тест скорости?", default=False):
+        defaults["speed_check"] = True
+        defaults["sort_by"] = "speed"
+    else:
+        defaults["speed_check"] = False
+        defaults["sort_by"] = "ping"
+
+    args = SimpleNamespace(**defaults)
+
+    safe_print("\n[yellow]>>> Инициализация проверки...[/]")
+    time.sleep(0.5)
+
+    try:
+        run_logic(args)
+    except Exception as e:
+        safe_print(f"[bold red]CRITICAL ERROR: {e}[/]")
+        import traceback
+        error_data = traceback.format_exc()
+        MAIN_LOGGER.log(f"CRASH REPORT:\n{error_data}")
+
+        if Confirm.ask("[bold magenta]Произошла ошибка. Загрузить лог на paste.rs для отладки?[/]", default=True):
+            upload_log_to_service(is_crash=True)
+
+        traceback.print_exc()
+
+    Prompt.ask("\n[bold]Нажмите Enter чтобы вернуться в меню...[/]", password=False)
+
+
 def interactive_menu():
     while True:
-        print_banner()
-        
-        table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED, expand=True)
-        table.add_column("№", style="cyan", width=4, justify="center")
-        table.add_column("Действие", style="white")
-        table.add_column("Описание", style="dim")
+        mt_cfg = get_mtproto_config(GLOBAL_CFG)
+        main_rows = [
+            ("1", "Проверка", "Xray/Mihomo, MTProto и агрегатор"),
+            ("2", "Настройки", "Ядро и ping-пороги"),
+            ("3", "Сервис", "Сброс ядер и загрузка логов"),
+            ("0", "Выход", "Закрыть программу"),
+        ]
+        main_choice = _render_interactive_menu("Главное меню", main_rows)
 
-        table.add_row("1", "Файл", "Загрузить прокси из .txt файла")
-        table.add_row("2", "Ссылка", "Загрузить прокси по URL")
-        table.add_row("3", "Перепроверка", f"Проверить заново {GLOBAL_CFG['output_file']}")
-        
-        if AGGREGATOR_AVAILABLE:
-            table.add_row("4", "Агрегатор", "Скачать базы, объединить и проверить")
-        
-        table.add_row("5", "Сброс ядер", "Убить все процессы xray/mihomo")
-        table.add_row("6", "Загрузить лог", "Отправить последние события на paste.rs")
-        table.add_row("7", "Свитч ядра", f"Режим: {GLOBAL_CFG.get('preferred_core', 'auto')}")
-        table.add_row("8", "Порог ping", f"Текущий: {GLOBAL_CFG.get('max_ping_ms', 500)} ms (0 = off)")
-        table.add_row("0", "Выход", "Закрыть программу")
-        
-        console.print(f"[dim]Version: v{__version__}[/]")
-        router_state = "ON" if _bool_value(GLOBAL_CFG.get("router_mode", False), False) else "OFF"
-        cleanup_state = normalize_cleanup_mode(GLOBAL_CFG.get("core_cleanup_mode", "owned"))
-        console.print(f"[dim]Router mode: {router_state} | Cleanup mode: {cleanup_state}[/]")
-        console.print(table)
-        
-        valid_choices = ["0", "1", "2", "3", "4", "5", "6", "7", "8"] if AGGREGATOR_AVAILABLE else ["0", "1", "2", "3", "5", "6", "7", "8"]
-        ch = Prompt.ask("[bold yellow]>[/] Выберите действие", choices=valid_choices)
-        
-        if ch == '0':
+        if main_choice == "0":
             sys.exit()
 
-        cfg_agg_countries = GLOBAL_CFG.get("agg_countries", [])
-        if isinstance(cfg_agg_countries, str):
-            cfg_agg_countries = cfg_agg_countries.split()
+        if main_choice == "1":
+            check_rows = [
+                ("1", "Xray: Файл", "Загрузить прокси из .txt файла"),
+                ("2", "Xray: Ссылка", "Загрузить прокси по URL"),
+                ("3", "Xray: Перепроверка", f"Проверить заново {GLOBAL_CFG['output_file']}"),
+                ("4", "MTProto: Файл", "Telegram proxy checker из файла"),
+                ("5", "MTProto: Ссылка", "Telegram proxy checker по ссылке или URL списка"),
+                ("6", "MTProto: Reuse", f"Проверить заново {mt_cfg.get('output_file', 'sortedMtproto.txt')}"),
+                ("0", "Назад", "Вернуться в главное меню"),
+            ]
+            if AGGREGATOR_AVAILABLE:
+                check_rows.insert(6, ("7", "Агрегатор", "Скачать базы, объединить и проверить"))
 
-        defaults = {
-            "file": None, "url": None, "reuse": False,
-            "domain": GLOBAL_CFG['test_domain'],
-            "timeout": GLOBAL_CFG['timeout'], 
-            "lport": GLOBAL_CFG['local_port_start'], 
-            "threads": GLOBAL_CFG['threads'], 
-            "core": GLOBAL_CFG['core_path'], 
-            "engine": GLOBAL_CFG.get("preferred_core", "auto"),
-            "router_mode": _bool_value(GLOBAL_CFG.get("router_mode", False), False),
-            "cleanup_mode": normalize_cleanup_mode(GLOBAL_CFG.get("core_cleanup_mode", "owned")),
-            "t2exec": GLOBAL_CFG['core_startup_timeout'], 
-            "t2kill": GLOBAL_CFG['core_kill_delay'], 
-            "output": GLOBAL_CFG['output_file'], 
-            "max_ping": GLOBAL_CFG.get("max_ping_ms", 500),
-            "shuffle": GLOBAL_CFG['shuffle'], 
-            "number": None,
-            "direct_list": None,
-            "agg_country": list(cfg_agg_countries),
-            "speed_check": GLOBAL_CFG['check_speed'],
-            "speed_test_url": GLOBAL_CFG['speed_test_url'],
-            "sort_by": GLOBAL_CFG['sort_by'],
-            "menu": True
-        }
-        
-        if ch == '1':
-            defaults["file"] = Prompt.ask("[cyan][?][/] Путь к файлу").strip('"')
-            if not defaults["file"]: continue
-            
-        elif ch == '2':
-            defaults["url"] = Prompt.ask("[cyan][?][/] URL ссылки").strip()
-            if not defaults["url"]: continue
-            
-        elif ch == '3':
-            defaults["reuse"] = True
-            
-        elif ch == '4' and AGGREGATOR_AVAILABLE:
-            console.print(Panel(f"Доступные категории: [green]{', '.join(GLOBAL_CFG.get('sources', {}).keys())}[/]", title="Агрегатор"))
-            cats = Prompt.ask("Введите категории (через пробел)", default="1 2").split()
-            kws = Prompt.ask("Фильтр (ключевые слова через пробел)", default="").split()
-            country_default = " ".join(cfg_agg_countries)
-            country_filters = Prompt.ask(
-                "Фильтр стран ISO2 (через пробел, опционально)",
-                default=country_default
-            ).split()
-            defaults["agg_country"] = country_filters
-            
-            sources_map = GLOBAL_CFG.get("sources", {})
-            try:
-                raw_links = aggregator.get_aggregated_links(
-                    sources_map,
-                    cats,
-                    kws,
-                    country_filters=country_filters,
-                    console=console
-                )
-                if not raw_links:
-                    safe_print("[bold red]Ничего не найдено агрегатором.[/]")
-                    time.sleep(2)
-                    continue
-                defaults["direct_list"] = raw_links
-            except Exception as e:
-                safe_print(f"[bold red]Ошибка агрегатора: {e}[/]")
+            action = _render_interactive_menu("Проверка", check_rows)
+            if action == "0":
                 continue
-            
-        elif ch == '5':
-            kill_all_cores_manual()
-            continue
-        elif ch == '6':
-            upload_log_to_service()
-            Prompt.ask("\nНажмите Enter...", password=False)
-            continue
-        elif ch == '7':
-            new_engine = Prompt.ask(
-                "Режим ядра",
-                choices=["auto", "xray", "mihomo"],
-                default=str(GLOBAL_CFG.get("preferred_core", "auto"))
-            )
-            GLOBAL_CFG["preferred_core"] = new_engine
-            if new_engine == "xray":
-                GLOBAL_CFG["core_path"] = "xray"
-            elif new_engine == "mihomo":
-                GLOBAL_CFG["core_path"] = "mihomo"
-            else:
-                GLOBAL_CFG["core_path"] = "auto"
 
-            ok, err = save_main_config(GLOBAL_CFG)
-            if ok:
-                safe_print(f"[green]✓ Ядро переключено: mode={new_engine}, core_path={GLOBAL_CFG['core_path']}[/]")
-            else:
-                safe_print(f"[yellow]Не удалось сохранить конфиг: {err}[/]")
-            time.sleep(1.0)
+            defaults = _build_interactive_defaults()
+            cfg_agg_countries = defaults["agg_country"]
+
+            if action == "1":
+                defaults["file"] = Prompt.ask("[cyan][?][/] Путь к файлу").strip('"')
+                if not defaults["file"]:
+                    continue
+            elif action == "2":
+                defaults["url"] = Prompt.ask("[cyan][?][/] URL ссылки").strip()
+                if not defaults["url"]:
+                    continue
+            elif action == "3":
+                defaults["reuse"] = True
+            elif action in ("4", "5", "6"):
+                defaults["mtproto"] = True
+                defaults["output"] = mt_cfg.get("output_file", "sortedMtproto.txt")
+                defaults["threads"] = int(mt_cfg.get("threads", 20) or 20)
+                defaults["timeout"] = int(mt_cfg.get("timeout", 5) or 5)
+                defaults["max_ping"] = int(mt_cfg.get("max_ping_ms", 0) or 0)
+                defaults["speed_check"] = False
+                defaults["sort_by"] = "ping"
+
+                if action == "4":
+                    defaults["file"] = Prompt.ask("[cyan][?][/] Путь к MTProto файлу").strip('"')
+                    if not defaults["file"]:
+                        continue
+                elif action == "5":
+                    defaults["url"] = Prompt.ask("[cyan][?][/] MTProto ссылка или URL списка").strip()
+                    if not defaults["url"]:
+                        continue
+                else:
+                    defaults["reuse"] = True
+            elif action == "7" and AGGREGATOR_AVAILABLE:
+                console.print(Panel(
+                    f"Доступные категории: [green]{', '.join(GLOBAL_CFG.get('sources', {}).keys())}[/]",
+                    title="Агрегатор"
+                ))
+                cats = Prompt.ask("Введите категории (через пробел)", default="1 2").split()
+                kws = Prompt.ask("Фильтр (ключевые слова через пробел)", default="").split()
+                country_default = " ".join(cfg_agg_countries)
+                country_filters = Prompt.ask(
+                    "Фильтр стран ISO2 (через пробел, опционально)",
+                    default=country_default
+                ).split()
+                defaults["agg_country"] = country_filters
+
+                sources_map = GLOBAL_CFG.get("sources", {})
+                try:
+                    raw_links = aggregator.get_aggregated_links(
+                        sources_map,
+                        cats,
+                        kws,
+                        country_filters=country_filters,
+                        console=console
+                    )
+                    if not raw_links:
+                        safe_print("[bold red]Ничего не найдено агрегатором.[/]")
+                        time.sleep(2)
+                        continue
+                    defaults["direct_list"] = raw_links
+                except Exception as e:
+                    safe_print(f"[bold red]Ошибка агрегатора: {e}[/]")
+                    continue
+
+            _run_interactive_args(defaults)
             continue
-        elif ch == '8':
-            raw_ping = Prompt.ask("Максимальный ping (мс), 0 = выключить фильтр", default=str(GLOBAL_CFG.get("max_ping_ms", 500)))
-            try:
-                max_ping = int(raw_ping)
-                if max_ping < 0:
-                    max_ping = 0
-                GLOBAL_CFG["max_ping_ms"] = max_ping
+
+        if main_choice == "2":
+            settings_rows = [
+                ("1", "Свитч ядра", f"Режим: {GLOBAL_CFG.get('preferred_core', 'auto')}"),
+                ("2", "Ping Xray/Mihomo", f"{GLOBAL_CFG.get('max_ping_ms', 500)} ms (0 = off)"),
+                ("3", "Ping MTProto", f"{mt_cfg.get('max_ping_ms', 0)} ms (0 = off)"),
+                ("0", "Назад", "Вернуться в главное меню"),
+            ]
+            action = _render_interactive_menu("Настройки", settings_rows)
+            if action == "0":
+                continue
+
+            if action == "1":
+                new_engine = Prompt.ask(
+                    "Режим ядра",
+                    choices=["auto", "xray", "mihomo"],
+                    default=str(GLOBAL_CFG.get("preferred_core", "auto"))
+                )
+                GLOBAL_CFG["preferred_core"] = new_engine
+                if new_engine == "xray":
+                    GLOBAL_CFG["core_path"] = "xray"
+                elif new_engine == "mihomo":
+                    GLOBAL_CFG["core_path"] = "mihomo"
+                else:
+                    GLOBAL_CFG["core_path"] = "auto"
+
                 ok, err = save_main_config(GLOBAL_CFG)
                 if ok:
-                    safe_print(f"[green]✓ Порог ping сохранён: {max_ping} ms[/]")
+                    safe_print(f"[green]✓ Ядро переключено: mode={new_engine}, core_path={GLOBAL_CFG['core_path']}[/]")
                 else:
                     safe_print(f"[yellow]Не удалось сохранить конфиг: {err}[/]")
-            except Exception:
-                safe_print("[yellow]Некорректное значение ping[/]")
-            time.sleep(1.0)
-            continue
-        if Confirm.ask("Включить тест скорости?", default=False):
-            defaults["speed_check"] = True
-            defaults["sort_by"] = "speed"
-        else:
-            defaults["speed_check"] = False
-            defaults["sort_by"] = "ping"
+                time.sleep(1.0)
+                continue
 
-        args = SimpleNamespace(**defaults)
-        
-        safe_print("\n[yellow]>>> Инициализация проверки...[/]")
-        time.sleep(0.5)
-        
-        try:
-            run_logic(args)
-        except Exception as e:
-            safe_print(f"[bold red]CRITICAL ERROR: {e}[/]")
-            import traceback
-            error_data = traceback.format_exc()
-            MAIN_LOGGER.log(f"CRASH REPORT:\n{error_data}")
-            
-            if Confirm.ask("[bold magenta]Произошла ошибка. Загрузить лог на paste.rs для отладки?[/]", default=True):
-                upload_log_to_service(is_crash=True)
-            
-            traceback.print_exc()
-        
-        Prompt.ask("\n[bold]Нажмите Enter чтобы вернуться в меню...[/]", password=False)
+            if action == "2":
+                raw_ping = Prompt.ask(
+                    "Максимальный ping (мс), 0 = выключить фильтр",
+                    default=str(GLOBAL_CFG.get("max_ping_ms", 500))
+                )
+                try:
+                    max_ping = int(raw_ping)
+                    if max_ping < 0:
+                        max_ping = 0
+                    GLOBAL_CFG["max_ping_ms"] = max_ping
+                    ok, err = save_main_config(GLOBAL_CFG)
+                    if ok:
+                        safe_print(f"[green]✓ Порог ping сохранён: {max_ping} ms[/]")
+                    else:
+                        safe_print(f"[yellow]Не удалось сохранить конфиг: {err}[/]")
+                except Exception:
+                    safe_print("[yellow]Некорректное значение ping[/]")
+                time.sleep(1.0)
+                continue
+
+            if action == "3":
+                raw_ping = Prompt.ask(
+                    "Максимальный ping для MTProto (мс), 0 = выключить фильтр",
+                    default=str(mt_cfg.get("max_ping_ms", 0))
+                )
+                try:
+                    max_ping = int(raw_ping)
+                    if max_ping < 0:
+                        max_ping = 0
+                    GLOBAL_CFG.setdefault("mtproto", {})
+                    GLOBAL_CFG["mtproto"]["max_ping_ms"] = max_ping
+                    ok, err = save_main_config(GLOBAL_CFG)
+                    if ok:
+                        safe_print(f"[green]✓ MTProto ping порог сохранён: {max_ping} ms[/]")
+                    else:
+                        safe_print(f"[yellow]Не удалось сохранить конфиг: {err}[/]")
+                except Exception:
+                    safe_print("[yellow]Некорректное значение ping[/]")
+                time.sleep(1.0)
+                continue
+
+        if main_choice == "3":
+            service_rows = [
+                ("1", "Сброс ядер", "Убить все процессы xray/mihomo"),
+                ("2", "Загрузить лог", "Отправить последние события на paste.rs"),
+                ("0", "Назад", "Вернуться в главное меню"),
+            ]
+            action = _render_interactive_menu("Сервис", service_rows)
+            if action == "0":
+                continue
+
+            if action == "1":
+                kill_all_cores_manual()
+                Prompt.ask("\nНажмите Enter...", password=False)
+                continue
+
+            if action == "2":
+                upload_log_to_service()
+                Prompt.ask("\nНажмите Enter...", password=False)
+                continue
 
 def main():
     skip_self_update = ("--no-update" in sys.argv) or (os.environ.get("MKXRAY_SKIP_SELF_UPDATE") == "1")
@@ -2982,6 +3405,7 @@ def main():
     parser.add_argument("-f", "--file")
     parser.add_argument("-u", "--url")
     parser.add_argument("--reuse", action="store_true")
+    parser.add_argument("--mtproto", action="store_true", help="Запустить отдельный checker MTProto proxy (tg://proxy / t.me/proxy)")
     
     parser.add_argument("-t", "--timeout", type=int, default=GLOBAL_CFG['timeout'])
     parser.add_argument("-l", "--lport", type=int, default=GLOBAL_CFG['local_port_start'])
@@ -3016,6 +3440,9 @@ def main():
         if getattr(args, 'self_test', False):
             print("Running URL parsing self-test...")
             success = _self_test_clean_url()
+            if MTPROTO_AVAILABLE and mtproto_checker is not None:
+                print("Running MTProto parsing self-test...")
+                success = mtproto_checker.run_parser_self_test(log_func=safe_print) and success
             sys.exit(0 if success else 1)
         
         if getattr(args, 'debug', False):
@@ -3023,6 +3450,8 @@ def main():
             GLOBAL_CFG['proxies_per_batch'] = 1
             GLOBAL_CFG['threads'] = 1
             safe_print("[yellow][DEBUG MODE] proxies_per_batch=1, threads=1[/]")
+
+        args = apply_mtproto_arg_defaults(args)
         
         if args.menu: interactive_menu()
         else:

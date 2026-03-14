@@ -18,7 +18,7 @@ from datetime import datetime
 # ВЕРСИЯ И КОНФИГУРАЦИЯ
 # Эта версия используется для сравнения с GitHub releases
 # ═══════════════════════════════════════════════════════════════════════════
-__version__ = "1.1.3"
+__version__ = "1.3.0"
 
 # Настройки репо по умолчанию (можно переопределить через config.json)
 DEFAULT_REPO = {
@@ -32,6 +32,8 @@ DEFAULT_REPO = {
 MANAGED_FILES = [
     ("v2rayChecker.py", True),    # обязательный
     ("aggregator.py", False),     # опциональный
+    ("mtproto_checker.py", True), # обязательный
+    ("mtproto_faketls.py", True), # обязательный
     ("updater.py", True),         # обязательный
     ("xray_installer.py", True),  # обязательный
     ("requirements.txt", True)    # обязательный (для совместимости зависимостей)
@@ -321,9 +323,15 @@ def _smoke_check_startup(script_dir):
     checker_path = os.path.join(script_dir, "v2rayChecker.py")
     if not os.path.exists(checker_path):
         return False, "v2rayChecker.py not found"
+    mtproto_path = os.path.join(script_dir, "mtproto_checker.py")
+    if not os.path.exists(mtproto_path):
+        return False, "mtproto_checker.py not found"
+    mtproto_faketls_path = os.path.join(script_dir, "mtproto_faketls.py")
+    if not os.path.exists(mtproto_faketls_path):
+        return False, "mtproto_faketls.py not found"
 
     try:
-        compile_cmd = [sys.executable, "-m", "py_compile", checker_path]
+        compile_cmd = [sys.executable, "-m", "py_compile", checker_path, mtproto_path, mtproto_faketls_path]
         comp = subprocess.run(
             compile_cmd,
             capture_output=True,
@@ -336,8 +344,10 @@ def _smoke_check_startup(script_dir):
             return False, tail or "py_compile failed"
 
         smoke_code = (
-            "import requests, psutil, urllib3, rich\n"
-            "import updater, xray_installer\n"
+            "import requests, psutil, urllib3, rich, telethon\n"
+            "import updater, xray_installer, mtproto_checker, mtproto_faketls\n"
+            "assert getattr(mtproto_checker, 'TELETHON_AVAILABLE', False), "
+            "getattr(mtproto_checker, 'TELETHON_IMPORT_ERROR', 'telethon unavailable')\n"
             "print('smoke-ok')\n"
         )
         import_cmd = [sys.executable, "-c", smoke_code]

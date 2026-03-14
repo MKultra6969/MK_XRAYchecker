@@ -5,3 +5,4 @@ pysocks
 rich
 art
 pyyaml
+telethon
