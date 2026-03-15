@@ -1,0 +1,66 @@
+name: "Feature request"
+description: "Suggest a new feature or improvement"
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe not only the idea, but also the practical problem it solves.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: What workflow is currently inconvenient or unsupported?
+      placeholder: It is hard to quickly separate subscription parsing bugs from dead raw source URLs.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What exactly should be added or changed?
+      placeholder: Add a dedicated source validation mode that checks raw URL status and prints a clear report.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What alternatives have you considered?
+      placeholder: Right now the only option is to run the checker manually and inspect logs.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area of change
+      options:
+        - Xray/Mihomo checker
+        - MTProto checker
+        - Subscription parsing / sources.json / --file
+        - Aggregator
+        - Updater / installer
+        - Menu / CLI
+        - Documentation / README
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: usage
+    attributes:
+      label: How should it be used?
+      description: Show the expected CLI, menu flow, or output format.
+      placeholder: |
+        Example CLI:
+        python v2rayChecker.py --validate-sources -f sources.json
+      render: bash
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Screenshots, logs, examples, links.

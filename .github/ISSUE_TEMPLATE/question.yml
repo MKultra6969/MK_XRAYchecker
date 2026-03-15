@@ -1,0 +1,54 @@
+name: "Question / support"
+description: "Ask a question about usage, configuration, or checker behavior"
+title: "[Question]: "
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For quick questions, check the README first.
+
+        If your question involves private configs or tokens, do not post secrets in the issue.
+
+  - type: dropdown
+    id: topic
+    attributes:
+      label: Topic
+      options:
+        - How to run the checker
+        - How MTProto mode works
+        - How to use sources.json / --file / --url
+        - How the aggregator works
+        - How the updater / installer works
+        - Unclear log output or behavior
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: Describe what is unclear.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: What have you already tried?
+      description: Include command line, config snippet, README section, or log fragment.
+      render: bash
+
+  - type: input
+    id: version
+    attributes:
+      label: MK_XRAYchecker version
+      placeholder: "1.3.1"
+
+  - type: input
+    id: platform
+    attributes:
+      label: OS / environment
+      placeholder: "Windows 11, Python 3.12"
