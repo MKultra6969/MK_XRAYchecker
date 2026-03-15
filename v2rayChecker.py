@@ -19,7 +19,7 @@
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
 # +═════════════════════════════════════════════════════════════════════════+
-# ║                           VERSION 1.3.0                                 ║
+# ║                           VERSION 1.3.1                                 ║
 # ║             В случае багов/недочётов создайте issue на github           ║
 # ║                                                                         ║
 # +═════════════════════════════════════════════════════════════════════════+
@@ -61,7 +61,7 @@ YAML_WARNED = False
 
 # ВЕРСИЯ СКРИПТА
 # Формат: MAJOR.MINOR.PATCH (SemVer)
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 
 def _ensure_utf8_stdio():
@@ -450,6 +450,8 @@ URL_FINDER = re.compile(
     re.IGNORECASE
 )
 
+HTTP_URL_FINDER = re.compile(r'https?://[^\s"\'<>]+', re.IGNORECASE)
+
 try:
     from rich.console import Console
     from rich.panel import Panel
@@ -499,6 +501,32 @@ def clean_url(url):
     
     return url
 
+
+def normalize_http_url(url):
+    """
+    Нормализация HTTP(S) URL-подписок: удаление мусорного обрамления,
+    которое часто остаётся при чтении JSON/Markdown/списков как обычного текста.
+    """
+    if not isinstance(url, str):
+        return ""
+
+    cleaned = clean_url(url).strip().strip("\"'<>")
+    cleaned = cleaned.rstrip('"\',;)]}>')
+    return cleaned if cleaned.lower().startswith(("http://", "https://")) else ""
+
+
+def _iter_string_values(payload):
+    if isinstance(payload, str):
+        yield payload
+        return
+    if isinstance(payload, dict):
+        for value in payload.values():
+            yield from _iter_string_values(value)
+        return
+    if isinstance(payload, (list, tuple, set)):
+        for item in payload:
+            yield from _iter_string_values(item)
+
 def _self_test_clean_url():
     """
     Юнит-тест для clean_url(): проверяет корректность декодирования
@@ -534,6 +562,38 @@ def _self_test_clean_url():
     
     safe_print(f"\n[bold]Self-test: {passed}/{len(test_cases)} passed[/]")
     return passed == len(test_cases)
+
+
+def _self_test_subscription_url_parsing():
+    test_url = "https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/main/githubmirror/10.txt"
+    payload = json.dumps({"2": [test_url, f"{test_url[:-6]}11.txt"]})
+    markdown_payload = f'- "{test_url}",\n'
+
+    checks = [
+        (
+            "normalize_http_url trims JSON tail",
+            normalize_http_url(f'"{test_url}",') == test_url,
+        ),
+        (
+            "extract_subscription_urls parses JSON sources",
+            extract_subscription_urls(payload) == sorted([test_url, f"{test_url[:-6]}11.txt"]),
+        ),
+        (
+            "extract_subscription_urls trims markdown/list wrappers",
+            extract_subscription_urls(markdown_payload) == [test_url],
+        ),
+    ]
+
+    passed = 0
+    for label, ok in checks:
+        if ok:
+            passed += 1
+            safe_print(f"[green]PASS[/]: {label}")
+        else:
+            safe_print(f"[red]FAIL[/]: {label}")
+
+    safe_print(f"\n[bold]Subscription URL self-test: {passed}/{len(checks)} passed[/]")
+    return passed == len(checks)
 
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
@@ -1194,23 +1254,39 @@ def parse_content(text):
 
 def extract_subscription_urls(text):
     urls = set()
-    for raw_line in (text or "").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line.startswith(("- ", "* ")):
-            line = line[2:].strip()
-        if not line:
-            continue
 
-        first_token = line.split()[0].strip("\"'<>")
-        cleaned = clean_url(first_token.rstrip(';,)]}'))
-        if cleaned.lower().startswith(("http://", "https://")):
+    raw_text = text or ""
+    stripped = raw_text.lstrip()
+    if stripped.startswith(("{", "[")):
+        try:
+            payload = json.loads(raw_text)
+        except Exception:
+            payload = None
+        if payload is not None:
+            for value in _iter_string_values(payload):
+                cleaned = normalize_http_url(value)
+                if cleaned:
+                    urls.add(cleaned)
+                    continue
+                for match in HTTP_URL_FINDER.findall(value):
+                    cleaned = normalize_http_url(match)
+                    if cleaned:
+                        urls.add(cleaned)
+
+    for match in HTTP_URL_FINDER.findall(raw_text):
+        cleaned = normalize_http_url(match)
+        if cleaned:
             urls.add(cleaned)
+
     return sorted(urls)
 
 def fetch_url(url):
     try:
+        raw_url = url
+        url = normalize_http_url(url)
+        if not url:
+            safe_print(f"{Fore.RED}>> Некорректный URL подписки: {raw_url}{Style.RESET_ALL}")
+            return []
         safe_print(f"{Fore.CYAN}>> Загрузка URL: {url}{Style.RESET_ALL}")
         resp = requests.get(url, timeout=15, verify=False)
         if resp.status_code == 200:
@@ -3440,6 +3516,7 @@ def main():
         if getattr(args, 'self_test', False):
             print("Running URL parsing self-test...")
             success = _self_test_clean_url()
+            success = _self_test_subscription_url_parsing() and success
             if MTPROTO_AVAILABLE and mtproto_checker is not None:
                 print("Running MTProto parsing self-test...")
                 success = mtproto_checker.run_parser_self_test(log_func=safe_print) and success

@@ -8,7 +8,7 @@
 
 <p>
   <a href="https://github.com/MKultra6969/MK_XRAYchecker">
-    <img src="https://img.shields.io/badge/VERSION-1.3.0-magenta?style=for-the-badge&logo=python" alt="Version">
+    <img src="https://img.shields.io/badge/VERSION-1.3.1-magenta?style=for-the-badge&logo=python" alt="Version">
   </a>
   <a href="http://www.wtfpl.net/">
     <img src="https://img.shields.io/badge/LICENSE-WTFPL-red?style=for-the-badge" alt="License">
@@ -19,7 +19,7 @@
 </p>
 
 ![Главное меню](https://raw.githubusercontent.com/MKultra6969/MK_XRAYchecker/main/menuShowcase/1.3.0.png)
-Главное меню v1.3.0
+Главное меню
 
 
 </div>
@@ -239,7 +239,7 @@ MTProto checker работает отдельно от Xray/Mihomo:
 | Аргумент | Описание |
 | :--- | :--- |
 | `-m`, `--menu` | Принудительный запуск интерактивного меню |
-| `-f`, `--file` | Путь к `.txt` с прокси или со списком URL-подписок |
+| `-f`, `--file` | Путь к `.txt`/`.json` с прокси или со списком URL-подписок |
 | `-u`, `--url` | URL ссылка на подписку или список (v1.1.3)|
 | `--agg` | Запустить встроенный агрегатор (граббер) прокси |
 | `--mtproto` | Запустить отдельный checker MTProto proxy (`tg://proxy`, `t.me/proxy`) |
