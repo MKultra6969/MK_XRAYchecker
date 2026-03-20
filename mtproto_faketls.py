@@ -10,10 +10,10 @@ import time
 
 from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomizedIntermediate
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 P25519 = 2 ** 255 - 19
-BASE64_URLSAFE_RE = re.compile(r"[^a-zA-Z0-9+/]+")
+BASE64_URLSAFE_RE = re.compile(r"[^a-zA-Z0-9+/_-]+")
 SYSTEM_RANDOM = random.SystemRandom()
 
 
@@ -25,6 +25,37 @@ def _decode_b64(secret):
     cleaned = BASE64_URLSAFE_RE.sub("", secret)
     cleaned += "=" * (-len(cleaned) % 4)
     return base64.urlsafe_b64decode(cleaned)
+
+
+def _coerce_faketls_secret(secret):
+    if isinstance(secret, (bytes, bytearray)):
+        full_secret = bytes(secret)
+    else:
+        secret_text = str(secret).strip()
+        full_secret = None
+
+        for candidate in (secret_text, f"ee{secret_text}"):
+            try:
+                full_secret = bytes.fromhex(candidate)
+            except ValueError:
+                continue
+            if full_secret[:1] == b"\xEE":
+                break
+        else:
+            for candidate in (secret_text, f"7{secret_text}"):
+                try:
+                    full_secret = _decode_b64(candidate)
+                except Exception:
+                    continue
+                if full_secret[:1] == b"\xEE":
+                    break
+            else:
+                full_secret = b""
+    if len(full_secret) < 18:
+        raise ValueError("FakeTLS secret is too short")
+    if full_secret[0] != 0xEE:
+        raise ValueError("FakeTLS secret must start with ee")
+    return full_secret
 
 
 def _gen_x25519_public_key():
@@ -114,13 +145,7 @@ class FakeTLSStreamWriter:
 
 class MTProxyFakeTLSClientCodec:
     def __init__(self, secret):
-        try:
-            full_secret = bytes.fromhex(f"ee{secret}")
-        except ValueError:
-            full_secret = _decode_b64(f"7{secret}")
-
-        if len(full_secret) < 18:
-            raise ValueError("FakeTLS secret is too short")
+        full_secret = _coerce_faketls_secret(secret)
 
         self.domain = full_secret[17:]
         self.secret = full_secret[1:17]

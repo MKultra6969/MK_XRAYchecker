@@ -2,10 +2,24 @@
 
 Почти все изменения проекта будут документироваться в этом файле.
 
+## [1.3.2] - 03-21-2026
+
+### Added
+- Поддержка `hex`, `base64` и `base64url` для `MTProto secret` в `tg://proxy` / `t.me/proxy`.
+
+### Changed
+- MTProto parser теперь канонизирует `secret` в `hex`, а live-результаты сохраняются в нормализованном `tg://proxy?...&secret=<hex>` виде.
+- Один и тот же MTProto proxy, пришедший в `hex`, `base64` или `base64url`, теперь схлопывается в один `unique_key`.
+
+### Fixed
+- Восстановление `+` после query-parsing для обычного `base64` `secret`, чтобы MTProto ссылки не ломались из-за `parse_qs`.
+- `dd` MTProto secrets больше не гоняются через неподходящие transport-режимы: checker использует только `randomized`.
+- FakeTLS backend теперь корректно принимает `ee` secrets из `hex`, обычного `base64` и `base64url`.
+
 ## [1.3.1] - 03-15-2026
 
 ### Added
-- Новый регрессионный self-test для парсинга subscription URL: проверяет JSON-списки источников и строки с markdown/json-обрамлением.
+- Новый регрессионный self-test для парсинга subscription URL: проверяет JSON-списки источников и строки с markdown/json-обрамлением. #5
 - GitHub issue templates для багов, feature request и вопросов по использованию.
 
 ### Changed

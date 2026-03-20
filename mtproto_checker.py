@@ -6,6 +6,8 @@
 # +═════════════════════════════════════════════════════════════════════════+
 
 import asyncio
+import base64
+import binascii
 import html
 import logging
 import re
@@ -16,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 try:
     from telethon import TelegramClient, connection, functions, utils
@@ -54,6 +56,8 @@ MTPROTO_URL_PATTERN = re.compile(
     re.IGNORECASE
 )
 HEX_SECRET_RE = re.compile(r"^[0-9a-fA-F]+$")
+BASE64_SECRET_RE = re.compile(r"^[A-Za-z0-9+/]*={0,2}$")
+BASE64_URLSAFE_SECRET_RE = re.compile(r"^[A-Za-z0-9\-_]*={0,2}$")
 STANDARD_SECRET_HEX_LEN = 32
 DD_SECRET_HEX_LEN = 34
 QUIET_TELETHON_LOGGER_NAME = "mk_xraychecker.mtproto.telethon"
@@ -135,11 +139,127 @@ def extract_mtproto_links(text):
     return unique_links, raw_hits
 
 
-def _first_param(params, key):
+def _first_param(params, key, *, strip=True):
     values = params.get(key, [])
     if not values:
         return ""
-    return str(values[0]).strip()
+    value = str(values[0])
+    return value.strip() if strip else value
+
+
+def _decode_base64_secret(secret, *, urlsafe=False):
+    raw = (secret or "").strip()
+    alphabet_re = BASE64_URLSAFE_SECRET_RE if urlsafe else BASE64_SECRET_RE
+    if not raw or not alphabet_re.fullmatch(raw):
+        raise ValueError("Unsupported secret encoding")
+    if "=" in raw[:-2]:
+        raise ValueError("Invalid base64 padding")
+
+    padless = raw.rstrip("=")
+    if len(raw) - len(padless) > 2 or (len(padless) % 4) == 1:
+        raise ValueError("Invalid base64 length")
+
+    normalized = padless
+    if urlsafe:
+        normalized = normalized.replace("-", "+").replace("_", "/")
+    padded = normalized + ("=" * (-len(normalized) % 4))
+    try:
+        return base64.b64decode(padded, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("Invalid base64 secret") from exc
+
+
+def _classify_secret_bytes(secret_bytes):
+    if len(secret_bytes) == 16:
+        return "standard", None
+    if len(secret_bytes) == 17 and secret_bytes[0] == 0xDD:
+        return "dd", None
+    if len(secret_bytes) >= 18 and secret_bytes[0] == 0xEE:
+        domain_bytes = secret_bytes[17:]
+        if not domain_bytes:
+            raise ValueError("FakeTLS secret is missing domain")
+        if any(byte < 0x20 or byte == 0x7F for byte in domain_bytes):
+            raise ValueError("FakeTLS domain contains control characters")
+        try:
+            fake_tls_domain = domain_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            fake_tls_domain = domain_bytes.decode("utf-8", errors="replace")
+        return "ee", fake_tls_domain
+    raise ValueError("Unsupported secret format")
+
+
+def decode_mtproto_secret(secret_raw):
+    secret_text = "" if secret_raw is None else str(secret_raw)
+    if not secret_text.strip():
+        raise ValueError("Missing secret")
+
+    secret_text_hex = secret_text.strip()
+    secret_text_base64 = secret_text.replace(" ", "+").strip()
+    secret_bytes = None
+    secret_encoding = ""
+
+    if HEX_SECRET_RE.fullmatch(secret_text_hex):
+        try:
+            secret_bytes = bytes.fromhex(secret_text_hex)
+        except ValueError as exc:
+            raise ValueError("Invalid hex secret") from exc
+        secret_encoding = "hex"
+    else:
+        has_std_symbols = ("+" in secret_text_base64) or ("/" in secret_text_base64)
+        has_urlsafe_symbols = ("-" in secret_text_base64) or ("_" in secret_text_base64)
+        if has_std_symbols and has_urlsafe_symbols:
+            raise ValueError("Mixed base64 alphabets are not supported")
+
+        candidates = []
+        if has_urlsafe_symbols:
+            candidates.append(("base64url", True))
+        elif has_std_symbols:
+            candidates.append(("base64", False))
+        else:
+            candidates.extend((
+                ("base64", False),
+                ("base64url", True),
+            ))
+
+        last_error = "Unsupported secret encoding"
+        for encoding_name, urlsafe in candidates:
+            try:
+                secret_bytes = _decode_base64_secret(secret_text_base64, urlsafe=urlsafe)
+                secret_encoding = encoding_name
+                break
+            except ValueError as exc:
+                last_error = str(exc)
+
+        if secret_bytes is None:
+            raise ValueError(last_error)
+
+    secret_mode, fake_tls_domain = _classify_secret_bytes(secret_bytes)
+    secret_hex = secret_bytes.hex()
+    if secret_mode == "ee":
+        telethon_secret = secret_bytes
+    elif secret_mode == "dd":
+        telethon_secret = secret_hex
+    else:
+        telethon_secret = secret_hex.upper() if secret_hex.startswith(("dd", "ee")) else secret_hex
+
+    return {
+        "secret_raw": secret_text_hex if secret_encoding == "hex" else secret_text_base64,
+        "secret_bytes": secret_bytes,
+        "secret_encoding": secret_encoding,
+        "secret_mode": secret_mode,
+        "secret_hex": secret_hex,
+        "fake_tls_domain": fake_tls_domain,
+        "telethon_secret": telethon_secret,
+    }
+
+
+def _build_canonical_mtproto_url(server, port, secret_hex):
+    query = urllib.parse.urlencode({
+        "server": server,
+        "port": str(port),
+        "secret": secret_hex,
+    })
+    return f"tg://proxy?{query}"
 
 
 def _normalize_mtproto_input(url):
@@ -173,7 +293,7 @@ def parse_mtproto_url(raw_url):
     params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
     server = _first_param(params, "server")
     port_raw = _first_param(params, "port")
-    secret = _first_param(params, "secret")
+    secret = _first_param(params, "secret", strip=False)
 
     if not server:
         return None, "Missing server"
@@ -190,37 +310,28 @@ def parse_mtproto_url(raw_url):
     if port < 1 or port > 65535:
         return None, "Port out of range"
 
-    secret = secret.strip()
-    if not HEX_SECRET_RE.fullmatch(secret):
-        return None, "Secret must be hex"
+    try:
+        secret_meta = decode_mtproto_secret(secret)
+    except ValueError as exc:
+        return None, str(exc)
 
-    secret_lower = secret.lower()
-    secret_mode = ""
-    telethon_secret = secret_lower
-    if len(secret_lower) == STANDARD_SECRET_HEX_LEN:
-        secret_mode = "standard"
-        if secret_lower.startswith(("dd", "ee")):
-            # Telethon strips lowercase dd/ee prefixes unconditionally.
-            # Uppercasing preserves a normal 16-byte hex secret as-is.
-            telethon_secret = secret.upper()
-    elif len(secret_lower) == DD_SECRET_HEX_LEN and secret_lower.startswith("dd"):
-        secret_mode = "dd"
-        telethon_secret = secret.upper()
-    elif len(secret_lower) > DD_SECRET_HEX_LEN and secret_lower.startswith("ee"):
-        secret_mode = "ee"
-        telethon_secret = secret_lower[2:]
-    else:
-        return None, "Unsupported secret format"
-
-    unique_key = f"{server.lower()}:{port}:{secret_lower}"
+    secret_hex = secret_meta["secret_hex"]
+    unique_key = f"{server.lower()}:{port}:{secret_hex}"
+    canonical_url = _build_canonical_mtproto_url(server, port, secret_hex)
     return {
         "original_url": original_url,
+        "canonical_url": canonical_url,
         "normalized_url": normalized_url,
         "server": server,
         "port": port,
-        "secret": secret_lower,
-        "secret_mode": secret_mode,
-        "telethon_secret": telethon_secret,
+        "secret": secret_hex,
+        "secret_raw": secret_meta["secret_raw"],
+        "secret_hex": secret_hex,
+        "secret_bytes": secret_meta["secret_bytes"],
+        "secret_encoding": secret_meta["secret_encoding"],
+        "secret_mode": secret_meta["secret_mode"],
+        "fake_tls_domain": secret_meta["fake_tls_domain"],
+        "telethon_secret": secret_meta["telethon_secret"],
         "unique_key": unique_key,
         "label": f"{server}:{port}",
     }, None
@@ -315,11 +426,7 @@ def _build_connection_candidates(entry):
     if secret_mode == "ee":
         return [("faketls", ConnectionTcpMTProxyFakeTLS)] if FAKETLS_AVAILABLE and ConnectionTcpMTProxyFakeTLS else []
     if secret_mode == "dd":
-        return [
-            ("randomized", connection.ConnectionTcpMTProxyRandomizedIntermediate),
-            ("intermediate", connection.ConnectionTcpMTProxyIntermediate),
-            ("abridged", connection.ConnectionTcpMTProxyAbridged),
-        ]
+        return [("randomized", connection.ConnectionTcpMTProxyRandomizedIntermediate)]
     return [
         ("intermediate", connection.ConnectionTcpMTProxyIntermediate),
         ("abridged", connection.ConnectionTcpMTProxyAbridged),
@@ -549,7 +656,7 @@ def run_mtproto_check(entries, runtime_cfg, log_func=None, progress_callback=Non
                             f"[green][LIVE][/] [white]{label:<25}[/] | "
                             f"{ping_ms:>4}ms | mtproto"
                         )
-                    current_live_results.append((entry["original_url"], ping_ms, 0.0))
+                    current_live_results.append((entry.get("canonical_url", entry["original_url"]), ping_ms, 0.0))
             else:
                 result["status"] = "fail"
                 if log_func:
@@ -583,7 +690,39 @@ def run_parser_self_test(log_func=print):
             True,
         ),
         (
+            "tg://proxy?server=example.com&port=443&secret=ABEiM0RVZneImaq7zN3u/w==",
+            True,
+        ),
+        (
+            "tg://proxy?server=example.com&port=443&secret=ABEiM0RVZneImaq7zN3u_w==",
+            True,
+        ),
+        (
+            "tg://proxy?server=example.com&port=443&secret=3QEjRWeJq83vASNFZ4mrze8=",
+            True,
+        ),
+        (
+            "tg://proxy?server=example.com&port=443&secret=7ptDuHVVv5Rk4Cvc0tuJMrB3d3cuc2l0ZS5jb20=",
+            True,
+        ),
+        (
+            "tg://proxy?server=example.com&port=443&secret=++/777777777777777777w==",
+            True,
+        ),
+        (
+            "tg://proxy?server=example.com&port=443&secret=--_777777777777777777w",
+            True,
+        ),
+        (
             "https://t.me/proxy?server=example.com&port=443",
+            False,
+        ),
+        (
+            "tg://proxy?server=example.com&port=443&secret=ee0123456789abcdef0123456789abcdef",
+            False,
+        ),
+        (
+            "tg://proxy?server=example.com&port=443&secret=not-valid***",
             False,
         ),
     ]
