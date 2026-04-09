@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 
 try:
     from telethon import TelegramClient, connection, functions, utils

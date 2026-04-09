@@ -10,7 +10,7 @@ import time
 
 from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomizedIntermediate
 
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 
 P25519 = 2 ** 255 - 19
 BASE64_URLSAFE_RE = re.compile(r"[^a-zA-Z0-9+/_-]+")
@@ -70,6 +70,17 @@ class FakeTLSStreamReader:
         self.upstream = upstream
         self.buf = bytearray()
 
+    async def _read_tls_record(self, timeout=None):
+        header = await asyncio.wait_for(self.upstream.readexactly(5), timeout=timeout)
+        tls_rec_type = header[:1]
+        version = header[1:3]
+        if version != b"\x03\x03":
+            raise ConnectionError(f"Unexpected TLS version: {version.hex()}")
+
+        data_len = int.from_bytes(header[3:5], "big")
+        payload = await asyncio.wait_for(self.upstream.readexactly(data_len), timeout=timeout)
+        return tls_rec_type, header + payload
+
     async def read(self, n, ignore_buf=False):
         if self.buf and not ignore_buf:
             data = self.buf
@@ -77,36 +88,38 @@ class FakeTLSStreamReader:
             return bytes(data)
 
         while True:
-            tls_rec_type = await self.upstream.readexactly(1)
-            if not tls_rec_type:
-                return b""
-
-            if tls_rec_type not in (b"\x14", b"\x17"):
-                return b""
-
-            version = await self.upstream.readexactly(2)
-            if version != b"\x03\x03":
-                return b""
-
-            data_len = int.from_bytes(await self.upstream.readexactly(2), "big")
-            data = await self.upstream.readexactly(data_len)
+            tls_rec_type, tls_record = await self._read_tls_record()
             if tls_rec_type == b"\x14":
                 continue
-            return data
+            if tls_rec_type != b"\x17":
+                raise ConnectionError(f"Unexpected TLS record type: {tls_rec_type.hex()}")
+            return tls_record[5:]
 
     async def readexactly(self, n):
         while len(self.buf) < n:
             tls_data = await self.read(1, ignore_buf=True)
-            if not tls_data:
-                return b""
             self.buf += tls_data
-        data, self.buf = self.buf[:n], self.buf[n:]
-        return bytes(data)
+        data = bytes(self.buf[:n])
+        self.buf = self.buf[n:]
+        return data
 
     async def read_server_hello(self):
-        server_hello = await self.upstream.readexactly(127 + 6 + 3 + 2)
-        http_data_len = int.from_bytes(server_hello[-2:], "big")
-        return server_hello + await self.upstream.readexactly(http_data_len)
+        try:
+            records = []
+            tls_rec_type, record = await self._read_tls_record(timeout=10.0)
+            if tls_rec_type != b"\x16":
+                raise ConnectionError(f"Unexpected first TLS record type: {tls_rec_type.hex()}")
+            records.append(record)
+
+            while True:
+                tls_rec_type, record = await self._read_tls_record(timeout=10.0)
+                records.append(record)
+                if tls_rec_type == b"\x17":
+                    return b"".join(records)
+                if tls_rec_type != b"\x14":
+                    raise ConnectionError(f"Unexpected TLS record type in server hello: {tls_rec_type.hex()}")
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError) as e:
+            raise ConnectionError(f"Failed to read ServerHello: {e}") from e
 
 
 class FakeTLSStreamWriter:
@@ -144,6 +157,27 @@ class FakeTLSStreamWriter:
 
 
 class MTProxyFakeTLSClientCodec:
+    CIPHER_SUITES = (
+        b"\xfa\xfa\x13\x01\x13\x02\x13\x03\xc0\x2b\xc0\x2f\xc0\x2c\xc0\x30"
+        b"\xcc\xa9\xcc\xa8\xc0\x13\xc0\x14\x00\x9c\x00\x9d\x00\x2f\x00\x35"
+    )
+    FIXED_EXTENSIONS = (
+        b"\x4a\x4a\x00\x00",
+        b"\x00\x17\x00\x00",
+        b"\xff\x01\x00\x01\x00",
+        b"\x00\x0a\x00\x0a\x00\x08\xba\xba\x00\x1d\x00\x17\x00\x18",
+        b"\x00\x0b\x00\x02\x01\x00",
+        b"\x00\x23\x00\x00",
+        b"\x00\x10\x00\x0e\x00\x0c\x02\x68\x32\x08\x68\x74\x74\x70\x2f\x31\x2e\x31",
+        b"\x00\x05\x00\x05\x01\x00\x00\x00\x00",
+        b"\x00\x0d\x00\x12\x00\x10\x04\x03\x08\x04\x04\x01\x05\x03\x08\x05\x05\x01\x08\x06\x06\x01",
+        b"\x00\x12\x00\x00",
+        b"\x00\x2d\x00\x02\x01\x01",
+        b"\x00\x2b\x00\x0b\x0a\x9a\x9a\x03\x04\x03\x03\x03\x02\x03\x01",
+        b"\x00\x1b\x00\x03\x02\x00\x02",
+        b"\x1a\x1a\x00\x01\x00",
+    )
+
     def __init__(self, secret):
         full_secret = _coerce_faketls_secret(secret)
 
@@ -152,125 +186,165 @@ class MTProxyFakeTLSClientCodec:
         if not self.domain:
             raise ValueError("FakeTLS secret is missing domain")
 
-        self.client_hello_dict = {
-            "content_type": b"\x16",
-            "version": b"\x03\x01",
-            "len": b"\x02\x00",
-            "handshake_type": b"\x01",
-            "handshake_len": b"\x00\x01\xfc",
-            "handshake_version": b"\x03\x03",
-            "random": b"\x00" * 32,
-            "session_id_len": b"\x20",
-            "session_id": b"\x00" * 32,
-            "cipher_suites_len": b"\x00\x20",
-            "cipher_suites": (
-                b"\xfa\xfa\x13\x01\x13\x02\x13\x03\xc0\x2b\xc0\x2f\xc0\x2c\xc0\x30"
-                b"\xcc\xa9\xcc\xa8\xc0\x13\xc0\x14\x00\x9c\x00\x9d\x00\x2f\x00\x35"
-            ),
-            "compression_methods_len": b"\x01",
-            "compression_methods": b"\x00",
-            "extensions_len": b"\x01\x93",
-            "ext_reserved_1": b"\x4a\x4a\x00\x00",
-            "ext_server_name_type": b"\x00\x00",
-            "ext_server_name_len": b"\x00\x00",
-            "ext_server_name_indication_list_len": b"\x00\x00",
-            "ext_server_name_indication_type": b"\x00",
-            "ext_server_name_indication_len": b"\x00\x00",
-            "ext_server_name_indication": b"\x00",
-            "ext_extended_master_secret": b"\x00\x17\x00\x00",
-            "ext_renegotiation_info": b"\xff\x01\x00\x01\x00",
-            "ext_supported_groups": b"\x00\x0a\x00\x0a\x00\x08\xba\xba\x00\x1d\x00\x17\x00\x18",
-            "ext_ec_point_formats": b"\x00\x0b\x00\x02\x01\x00",
-            "ext_session_ticket": b"\x00\x23\x00\x00",
-            "ext_alpn": b"\x00\x10\x00\x0e\x00\x0c\x02\x68\x32\x08\x68\x74\x74\x70\x2f\x31\x2e\x31",
-            "ext_status_request": b"\x00\x05\x00\x05\x01\x00\x00\x00\x00",
-            "ext_signature_algorithms": (
-                b"\x00\x0d\x00\x12\x00\x10\x04\x03\x08\x04\x04\x01\x05\x03\x08\x05\x05\x01\x08\x06\x06\x01"
-            ),
-            "ext_signature_cert_timestamp": b"\x00\x12\x00\x00",
-            "ext_key_share_type": b"\x00\x33",
-            "ext_key_share_len": b"\x00\x2b",
-            "ext_key_share_client_key_len": b"\x00\x29",
-            "ext_key_share_reserved": b"\xba\xba\x00\x01\x00",
-            "ext_key_share_group": b"\x00\x1d",
-            "ext_key_share_exchange_len": b"\x00\x20",
-            "ext_key_share_exchange": b"\x00",
-            "ext_psk_key_exchange_modes": b"\x00\x2d\x00\x02\x01\x01",
-            "ext_supported_tls_versions": b"\x00\x2b\x00\x0b\x0a\x9a\x9a\x03\x04\x03\x03\x03\x02\x03\x01",
-            "ext_compress_cert": b"\x00\x1b\x00\x03\x02\x00\x02",
-            "ext_reserved_2": b"\x1a\x1a\x00\x01\x00",
-            "ext_padding_type": b"\x00\x15",
-            "ext_padding_len": b"\x00\x00",
-            "ext_padding": b"",
-        }
-        self.is_pkt_changed = True
+        self.client_random = b"\x00" * 32
+        self.session_id = b"\x00" * 32
+        self.key_share = b"\x00" * 32
+        self.ech_grease_flag = b"\x00"
+        self.ech_grease_random = b"\x00" * 32
         self.pkt = b""
 
-    def client_hello(self, key, value=None):
-        if value is None:
-            return self.client_hello_dict[key]
-        if isinstance(value, str):
-            value = value.encode("utf-8")
-        elif isinstance(value, int):
-            value = value.to_bytes(length=len(self.client_hello_dict[key]), byteorder="big")
-        self.client_hello_dict[key] = value
-        self.is_pkt_changed = True
+    @staticmethod
+    def _pack_extension(ext_type, payload):
+        return ext_type + len(payload).to_bytes(2, "big") + payload
 
-    def glue_pkt(self):
-        if self.is_pkt_changed:
-            self.pkt = b"".join(self.client_hello_dict.values())
-            self.is_pkt_changed = False
-        return self.pkt
+    @staticmethod
+    def _padding_extension_length(current_size):
+        tls_record_header_size = 5
+        if current_size <= tls_record_header_size:
+            return 0
+
+        message_length = current_size - tls_record_header_size
+        if message_length <= 0xFF or message_length >= 0x200:
+            return 0
+
+        padding_length = 0x200 - message_length
+        return padding_length if padding_length < 5 else padding_length - 4
+
+    @staticmethod
+    def _iter_tls_records(data):
+        records = []
+        offset = 0
+        while offset < len(data):
+            if len(data) - offset < 5:
+                raise ValueError("Incomplete TLS record header")
+
+            record_len = int.from_bytes(data[offset + 3:offset + 5], "big")
+            next_offset = offset + 5 + record_len
+            if next_offset > len(data):
+                raise ValueError("Incomplete TLS record payload")
+
+            records.append(data[offset:next_offset])
+            offset = next_offset
+
+        return records
+
+    def _build_server_name_extension(self):
+        host_name = bytes(self.domain)
+        server_name = b"\x00" + len(host_name).to_bytes(2, "big") + host_name
+        payload = len(server_name).to_bytes(2, "big") + server_name
+        return self._pack_extension(b"\x00\x00", payload)
+
+    def _build_key_share_extension(self):
+        payload = b"\x00\x29\xba\xba\x00\x01\x00\x00\x1d\x00\x20" + self.key_share
+        return self._pack_extension(b"\x00\x33", payload)
+
+    def _build_ech_grease_extension(self):
+        payload = (
+            b"\x00\x01\x00\x01"
+            + self.ech_grease_flag
+            + b"\x00\x20"
+            + self.ech_grease_random
+            + len(self.key_share).to_bytes(2, "big")
+            + self.key_share
+        )
+        return self._pack_extension(b"\xfe\x0d", payload)
+
+    def _build_padding_extension(self, current_size):
+        padding_len = self._padding_extension_length(current_size)
+        if padding_len <= 0:
+            return b""
+        return self._pack_extension(b"\x00\x15", b"\x00" * padding_len)
+
+    def _build_extensions(self, base_only=False):
+        extensions = [self.FIXED_EXTENSIONS[0], self._build_server_name_extension()]
+        extensions.extend(self.FIXED_EXTENSIONS[1:10])
+        extensions.append(self._build_key_share_extension())
+        extensions.extend(self.FIXED_EXTENSIONS[10:13])
+        extensions.append(self._build_ech_grease_extension())
+        extensions.append(self.FIXED_EXTENSIONS[13])
+
+        encoded = b"".join(extensions)
+        if base_only:
+            return encoded
+
+        packet_without_padding = self._build_packet(self.client_random, encoded)
+        return encoded + self._build_padding_extension(len(packet_without_padding))
+
+    def _build_packet(self, random_bytes, extensions):
+        handshake_body = (
+            b"\x03\x03"
+            + random_bytes
+            + len(self.session_id).to_bytes(1, "big")
+            + self.session_id
+            + len(self.CIPHER_SUITES).to_bytes(2, "big")
+            + self.CIPHER_SUITES
+            + b"\x01\x00"
+            + len(extensions).to_bytes(2, "big")
+            + extensions
+        )
+        handshake = b"\x01" + len(handshake_body).to_bytes(3, "big") + handshake_body
+        return b"\x16\x03\x01" + len(handshake).to_bytes(2, "big") + handshake
 
     def gen_set_session_id(self):
-        self.client_hello("session_id", os.urandom(32))
-
-    def set_domain(self):
-        domain_len = len(self.domain)
-        self.client_hello("ext_server_name_len", 2 + 1 + 2 + domain_len)
-        self.client_hello("ext_server_name_indication_list_len", 1 + 2 + domain_len)
-        self.client_hello("ext_server_name_indication_len", domain_len)
-        self.client_hello("ext_server_name_indication", self.domain)
+        self.session_id = os.urandom(32)
 
     def gen_set_key_share(self):
-        self.client_hello("ext_key_share_exchange", _gen_x25519_public_key())
+        self.key_share = _gen_x25519_public_key()
 
-    def fix_padding(self):
-        self.client_hello("ext_padding", b"")
-        padding_len = 517 - len(self.glue_pkt())
-        self.client_hello("ext_padding_len", padding_len)
-        self.client_hello("ext_padding", b"\x00" * padding_len)
+    def gen_set_ech_grease(self):
+        self.ech_grease_flag = os.urandom(1)
+        self.ech_grease_random = os.urandom(32)
 
     def gen_set_random(self):
-        self.client_hello("random", b"\x00" * 32)
-        digest = _gen_sha256_digest(self.secret, self.glue_pkt())
+        base_extensions = self._build_extensions(base_only=False)
+        digest = _gen_sha256_digest(self.secret, self._build_packet(b"\x00" * 32, base_extensions))
         current_time = int(time.time()).to_bytes(length=4, byteorder="little")
         xored_time = bytes(current_time[i] ^ digest[28 + i] for i in range(4))
-        digest = digest[:28] + xored_time
-        self.client_hello("random", digest)
+        self.client_random = digest[:28] + xored_time
 
     def build_new_client_hello_packet(self):
         self.gen_set_session_id()
-        self.set_domain()
         self.gen_set_key_share()
-        self.fix_padding()
+        self.gen_set_ech_grease()
         self.gen_set_random()
-        return self.glue_pkt()
+        self.pkt = self._build_packet(self.client_random, self._build_extensions())
+        return self.pkt
 
     def verify_server_hello(self, server_hello):
-        if len(server_hello) < 127 + 6:
-            return False
-        if not server_hello.startswith(b"\x16\x03\x03"):
-            return False
-        if server_hello[127:136] != b"\x14\x03\x03\x00\x01\x01\x17\x03\x03":
-            return False
-        if server_hello[44:76] != self.client_hello_dict["session_id"]:
+        try:
+            records = self._iter_tls_records(server_hello)
+        except ValueError:
             return False
 
-        client_digest = self.client_hello_dict["random"]
+        if len(records) < 2:
+            return False
+        if records[0][:3] != b"\x16\x03\x03":
+            return False
+        if any(record[1:3] != b"\x03\x03" for record in records):
+            return False
+        if records[-1][:1] != b"\x17":
+            return False
+        if any(record[:1] not in (b"\x14", b"\x17") for record in records[1:]):
+            return False
+        if len(records[0]) < 44:
+            return False
+
+        handshake_payload = records[0][5:]
+        if len(handshake_payload) < 39 or handshake_payload[:1] != b"\x02":
+            return False
+
+        session_id_len = handshake_payload[38]
+        session_id = handshake_payload[39:39 + session_id_len]
+        if session_id != self.session_id:
+            return False
+        if len(records[0]) < 43:
+            return False
+
+        client_digest = self.client_random
         server_digest = server_hello[11:43]
-        server_hello = server_hello[:11] + (b"\x00" * 32) + server_hello[43:]
-        computed_digest = _gen_sha256_digest(self.secret, client_digest + server_hello)
+        zeroed_server_hello = bytearray(server_hello)
+        zeroed_server_hello[11:43] = b"\x00" * 32
+        computed_digest = _gen_sha256_digest(self.secret, client_digest + bytes(zeroed_server_hello))
         return server_digest == computed_digest
 
 
