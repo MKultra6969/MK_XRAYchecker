@@ -168,7 +168,7 @@ python v2rayChecker.py --no-update
   - `dc_probe_limit`: сколько лучших Telegram DC пробовать для одного MTProto proxy.
   - `output_file`: отдельный output-файл, например `sortedMtproto.txt`.
 
-> ⚠️ `api_id` и `api_hash` лежат в `config.json` в открытом виде. Не коммить реальные значения.
+> ⚠️ `api_id` и `api_hash` лежат в `config.json` в открытом виде.
 
 ---
 
