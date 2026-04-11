@@ -2,6 +2,16 @@
 
 Почти все изменения проекта будут документироваться в этом файле.
 
+## [1.3.4] - 04-11-2026
+
+### Changed
+- MTProto checker теперь выделяет сетевую недоступность proxy в отдельный статус `UNREACH`, чтобы сразу отличать недоступный proxy-хост от transport/FakeTLS/DC ошибок.
+
+### Fixed
+- Исправлено падение MTProto checker на части `ee/FakeTLS` proxy: первый TLS `application_data` после `ServerHello` больше не теряется, поэтому Telethon не получает сдвинутый MTProto-поток. #7
+- MTProto worker больше не валит весь checker на `BaseException`-уровневых ошибках вроде `PanicException` из `cryptg`: connect/probe/disconnect path восстанавливается в нормальный результат проверки. #7
+- Сообщение `dcX/faketls: Timeout` больше не маскирует кейс, когда сам proxy-хост недоступен по TCP с текущей машины.
+
 ## [1.3.3] - 04-10-2026
 
 ### Fixed

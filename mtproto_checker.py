@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-__version__ = "1.3.3"
+__version__ = "1.3.4"
 
 try:
     from telethon import TelegramClient, connection, functions, utils
@@ -421,6 +421,10 @@ def _format_probe_error(exc):
     return f"{exc.__class__.__name__}: {message}"
 
 
+def _should_reraise_base_exception(exc):
+    return isinstance(exc, (KeyboardInterrupt, SystemExit))
+
+
 def _build_connection_candidates(entry):
     secret_mode = entry.get("secret_mode")
     if secret_mode == "ee":
@@ -432,6 +436,29 @@ def _build_connection_candidates(entry):
         ("abridged", connection.ConnectionTcpMTProxyAbridged),
         ("randomized", connection.ConnectionTcpMTProxyRandomizedIntermediate),
     ]
+
+
+async def _probe_proxy_reachability(entry, timeout):
+    writer = None
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host=entry["server"], port=int(entry["port"])),
+            timeout=timeout,
+        )
+        return None
+    except asyncio.TimeoutError:
+        return f"Proxy TCP connect timed out after {int(timeout)}s"
+    except OSError as exc:
+        return f"Proxy TCP connect failed: {_format_probe_error(exc)}"
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+                wait_closed = getattr(writer, "wait_closed", None)
+                if callable(wait_closed):
+                    await asyncio.wait_for(wait_closed(), timeout=1)
+            except Exception:
+                pass
 
 
 async def _connect_sender_only(client, timeout, dc_candidate=None):
@@ -486,6 +513,7 @@ async def _probe_mtproto_async(entry, runtime_cfg):
     api_id = int(runtime_cfg.get("api_id") or 0)
     api_hash = str(runtime_cfg.get("api_hash") or "").strip()
     timeout = float(runtime_cfg.get("timeout") or 5)
+    proxy_reachability_timeout = min(max(timeout, 1.0), 5.0)
 
     candidates = _build_connection_candidates(entry)
     if not candidates:
@@ -497,6 +525,15 @@ async def _probe_mtproto_async(entry, runtime_cfg):
                 "FakeTLS backend unavailable"
                 + (f": {FAKETLS_IMPORT_ERROR}" if FAKETLS_IMPORT_ERROR else "")
             ),
+        }
+
+    proxy_error = await _probe_proxy_reachability(entry, proxy_reachability_timeout)
+    if proxy_error:
+        return {
+            "entry": entry,
+            "ping_ms": None,
+            "status": "proxy_unreachable",
+            "error": proxy_error,
         }
 
     dc_candidates = runtime_cfg.get("dc_candidates") or TELEGRAM_DC_OPTIONS[:DEFAULT_DC_PROBE_LIMIT]
@@ -544,7 +581,9 @@ async def _probe_mtproto_async(entry, runtime_cfg):
                         "transport": transport_name,
                         "dc_id": dc_id,
                     }
-                except Exception as exc:
+                except BaseException as exc:
+                    if _should_reraise_base_exception(exc):
+                        raise
                     best_connect_only = {
                         "entry": entry,
                         "ping_ms": connect_ping_ms,
@@ -556,14 +595,28 @@ async def _probe_mtproto_async(entry, runtime_cfg):
                     last_error = f"dc{dc_id}/{transport_name}: {best_connect_only['error']}"
             except asyncio.TimeoutError:
                 last_error = f"dc{dc_id}/{transport_name}: Timeout"
-            except Exception as exc:
+            except BaseException as exc:
+                if _should_reraise_base_exception(exc):
+                    raise
                 last_error = f"dc{dc_id}/{transport_name}: {_format_probe_error(exc)}"
             finally:
                 try:
                     await client.disconnect()
                     await asyncio.sleep(0)
-                except Exception:
-                    pass
+                except BaseException as exc:
+                    if _should_reraise_base_exception(exc):
+                        raise
+                    disconnect_error = _format_probe_error(exc)
+                    if best_connect_only is None:
+                        best_connect_only = {
+                            "entry": entry,
+                            "ping_ms": None,
+                            "status": "fail",
+                            "error": f"disconnect failed: {disconnect_error}",
+                            "transport": transport_name,
+                            "dc_id": dc_id,
+                        }
+                    last_error = f"dc{dc_id}/{transport_name}: disconnect failed: {disconnect_error}"
 
     if best_connect_only is not None:
         return best_connect_only
@@ -624,10 +677,24 @@ def run_mtproto_check(entries, runtime_cfg, log_func=None, progress_callback=Non
 
     max_workers = min(len(entries), threads)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_probe_mtproto_sync, entry, runtime_cfg) for entry in entries]
+        future_to_entry = {
+            executor.submit(_probe_mtproto_sync, entry, runtime_cfg): entry
+            for entry in entries
+        }
 
-        for future in as_completed(futures):
-            result = future.result()
+        for future in as_completed(future_to_entry):
+            entry = future_to_entry[future]
+            try:
+                result = future.result()
+            except BaseException as exc:
+                if _should_reraise_base_exception(exc):
+                    raise
+                result = {
+                    "entry": entry,
+                    "ping_ms": None,
+                    "status": "fail",
+                    "error": f"worker crash recovered: {_format_probe_error(exc)}",
+                }
             all_results.append(result)
 
             entry = result["entry"]
@@ -658,12 +725,19 @@ def run_mtproto_check(entries, runtime_cfg, log_func=None, progress_callback=Non
                         )
                     current_live_results.append((entry.get("canonical_url", entry["original_url"]), ping_ms, 0.0))
             else:
-                result["status"] = "fail"
-                if log_func:
-                    log_func(
-                        f"[red][FAIL][/] [white]{label:<25}[/] | "
-                        f"{error_reason or 'Unknown error'} | mtproto"
-                    )
+                if result.get("status") == "proxy_unreachable":
+                    if log_func:
+                        log_func(
+                            f"[yellow][UNREACH][/] [white]{label:<25}[/] | "
+                            f"{error_reason or 'Proxy unreachable'} | mtproto"
+                        )
+                else:
+                    result["status"] = "fail"
+                    if log_func:
+                        log_func(
+                            f"[red][FAIL][/] [white]{label:<25}[/] | "
+                            f"{error_reason or 'Unknown error'} | mtproto"
+                        )
 
             if progress_callback:
                 progress_callback()
@@ -687,6 +761,10 @@ def run_parser_self_test(log_func=print):
         ),
         (
             "tg://proxy?server=example.com&port=443&secret=ee9b43b87555bf9464e02bdcd2db8932b07777772e736974652e636f6d",
+            True,
+        ),
+        (
+            "tg://proxy?server=104.253.134.194&port=443&secret=ee684d76827ec8317657e6f0eaa66ee67577622e7275",
             True,
         ),
         (

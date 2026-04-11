@@ -8,7 +8,7 @@
 
 <p>
   <a href="https://github.com/MKultra6969/MK_XRAYchecker">
-    <img src="https://img.shields.io/badge/VERSION-1.3.3-magenta?style=for-the-badge&logo=python" alt="Version">
+    <img src="https://img.shields.io/badge/VERSION-1.3.4-magenta?style=for-the-badge&logo=python" alt="Version">
   </a>
   <a href="http://www.wtfpl.net/">
     <img src="https://img.shields.io/badge/LICENSE-WTFPL-red?style=for-the-badge" alt="License">
@@ -206,13 +206,14 @@ MTProto checker работает отдельно от Xray/Mihomo:
 - для `standard/dd` перебирает несколько MTProto transport-режимов, а для `ee` использует отдельный FakeTLS backend;
 - сортирует результаты только по ping;
 - не делает speed-test;
-- показывает отдельные статусы `LIVE / CONN / DROP / FAIL`;
+- показывает отдельные статусы `LIVE / CONN / DROP / UNREACH / FAIL`;
 - пишет результат в отдельный файл (`sortedMtproto.txt` по умолчанию).
 
 Грубая интерпретация статусов:
 - `LIVE`: proxy прошёл MTProto connect и Telegram RPC probe.
 - `CONN`: proxy принял MTProto connect, но не довёл до успешного Telegram RPC.
 - `DROP`: proxy живой, но отфильтрован по `max_ping_ms`.
+- `UNREACH`: до proxy не удалось поднять даже сырой TCP connect с текущей машины.
 - `FAIL`: proxy не прошёл connect / handshake / probe.
 
 Для проверки именно живых MTProto proxy, а не только быстрых, ставь `MTProto ping = 0` или `--max-ping 0`. Если укажешь `--speed` или `--sort speed` вместе с `--mtproto`, режим будет принудительно возвращён к ping-сортировке с предупреждением.

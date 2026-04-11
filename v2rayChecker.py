@@ -19,7 +19,7 @@
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
 # +═════════════════════════════════════════════════════════════════════════+
-# ║                           VERSION 1.3.3                                 ║
+# ║                           VERSION 1.3.4                                 ║
 # ║             В случае багов/недочётов создайте issue на github           ║
 # ║                                                                         ║
 # +═════════════════════════════════════════════════════════════════════════+
@@ -61,7 +61,7 @@ YAML_WARNED = False
 
 # ВЕРСИЯ СКРИПТА
 # Формат: MAJOR.MINOR.PATCH (SemVer)
-__version__ = "1.3.3"
+__version__ = "1.3.4"
 
 
 def _ensure_utf8_stdio():
@@ -2758,10 +2758,11 @@ def run_mtproto_logic(args):
     live_count = len([item for item in all_results if item.get("status") == "live"])
     connect_only_count = len([item for item in all_results if item.get("status") == "connect_only"])
     drop_count = len([item for item in all_results if item.get("status") == "drop"])
+    unreachable_count = len([item for item in all_results if item.get("status") == "proxy_unreachable"])
     failed_count = len([item for item in all_results if item.get("status") == "fail"])
     safe_print(
         f"\n[bold green]MTProto готово! LIVE: {live_count}. "
-        f"CONN: {connect_only_count}. DROP: {drop_count}. FAIL: {failed_count}. "
+        f"CONN: {connect_only_count}. DROP: {drop_count}. UNREACH: {unreachable_count}. FAIL: {failed_count}. "
         f"Результат в: {runtime_cfg['output_file']}[/]"
     )
     if runtime_cfg.get("max_ping_ms", 0) > 0 and drop_count > 0:

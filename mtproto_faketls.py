@@ -10,7 +10,7 @@ import time
 
 from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomizedIntermediate
 
-__version__ = "1.3.3"
+__version__ = "1.3.4"
 
 P25519 = 2 ** 255 - 19
 BASE64_URLSAFE_RE = re.compile(r"[^a-zA-Z0-9+/_-]+")
@@ -81,6 +81,11 @@ class FakeTLSStreamReader:
         payload = await asyncio.wait_for(self.upstream.readexactly(data_len), timeout=timeout)
         return tls_rec_type, header + payload
 
+    def _push_back_payload(self, tls_record):
+        payload = tls_record[5:]
+        if payload:
+            self.buf.extend(payload)
+
     async def read(self, n, ignore_buf=False):
         if self.buf and not ignore_buf:
             data = self.buf
@@ -115,6 +120,8 @@ class FakeTLSStreamReader:
                 tls_rec_type, record = await self._read_tls_record(timeout=10.0)
                 records.append(record)
                 if tls_rec_type == b"\x17":
+                    # Preserve the first application-data payload for Telethon.
+                    self._push_back_payload(record)
                     return b"".join(records)
                 if tls_rec_type != b"\x14":
                     raise ConnectionError(f"Unexpected TLS record type in server hello: {tls_rec_type.hex()}")
