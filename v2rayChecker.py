@@ -19,7 +19,7 @@
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
 # +═════════════════════════════════════════════════════════════════════════+
-# ║                           VERSION 1.3.5                                 ║
+# ║                           VERSION 1.4.0                                 ║
 # ║             В случае багов/недочётов создайте issue на github           ║
 # ║                                                                         ║
 # +═════════════════════════════════════════════════════════════════════════+
@@ -61,7 +61,7 @@ YAML_WARNED = False
 
 # ВЕРСИЯ СКРИПТА
 # Формат: MAJOR.MINOR.PATCH (SemVer)
-__version__ = "1.3.5"
+__version__ = "1.4.0"
 
 
 def _ensure_utf8_stdio():
@@ -335,6 +335,7 @@ DEFAULT_CONFIG = {
         "timeout": 5,
         "max_ping_ms": 666,
         "dc_probe_limit": 3,
+        "crypto_backend": "auto",
         "output_file": "sortedMtproto.txt"
     }
 }
@@ -2588,6 +2589,10 @@ def build_mtproto_runtime_cfg(args):
     runtime_cfg["timeout"] = max(1, int(getattr(args, "timeout", runtime_cfg.get("timeout", 5)) or 1))
     runtime_cfg["max_ping_ms"] = max(0, int(getattr(args, "max_ping", runtime_cfg.get("max_ping_ms", 0)) or 0))
     runtime_cfg["dc_probe_limit"] = max(1, int(runtime_cfg.get("dc_probe_limit", 3) or 3))
+    runtime_cfg["crypto_backend"] = str(
+        getattr(args, "mtproto_crypto", runtime_cfg.get("crypto_backend", "auto"))
+        or runtime_cfg.get("crypto_backend", "auto")
+    ).strip().lower()
     runtime_cfg["output_file"] = str(getattr(args, "output", runtime_cfg.get("output_file", "sortedMtproto.txt")) or runtime_cfg.get("output_file", "sortedMtproto.txt"))
     return runtime_cfg
 
@@ -2691,6 +2696,8 @@ def run_mtproto_logic(args):
     if not full:
         safe_print("[bold red]Нет MTProto прокси для проверки.[/]")
         return
+
+    safe_print(f"[dim]MTProto crypto backend: {mtproto_checker.describe_crypto_backend(runtime_cfg, full)}[/]")
 
     dc_candidates = mtproto_checker.rank_telegram_dcs(limit=int(runtime_cfg.get("dc_probe_limit", 3) or 3))
     runtime_cfg["dc_candidates"] = dc_candidates
@@ -3376,6 +3383,7 @@ def interactive_menu():
                 ("1", "Свитч ядра", f"Режим: {GLOBAL_CFG.get('preferred_core', 'auto')}"),
                 ("2", "Ping Xray/Mihomo", f"{GLOBAL_CFG.get('max_ping_ms', 500)} ms (0 = off)"),
                 ("3", "Ping MTProto", f"{mt_cfg.get('max_ping_ms', 0)} ms (0 = off)"),
+                ("4", "Crypto MTProto", str(mt_cfg.get("crypto_backend", "auto"))),
                 ("0", "Назад", "Вернуться в главное меню"),
             ]
             action = _render_interactive_menu("Настройки", settings_rows)
@@ -3445,6 +3453,22 @@ def interactive_menu():
                 time.sleep(1.0)
                 continue
 
+            if action == "4":
+                crypto_backend = Prompt.ask(
+                    "Режим crypto backend для MTProto",
+                    choices=["auto", "safe", "unsafe"],
+                    default=str(mt_cfg.get("crypto_backend", "auto"))
+                )
+                GLOBAL_CFG.setdefault("mtproto", {})
+                GLOBAL_CFG["mtproto"]["crypto_backend"] = crypto_backend
+                ok, err = save_main_config(GLOBAL_CFG)
+                if ok:
+                    safe_print(f"[green]✓ MTProto crypto backend сохранён: {crypto_backend}[/]")
+                else:
+                    safe_print(f"[yellow]Не удалось сохранить конфиг: {err}[/]")
+                time.sleep(1.0)
+                continue
+
         if main_choice == "3":
             service_rows = [
                 ("1", "Сброс ядер", "Убить все процессы xray/mihomo"),
@@ -3483,6 +3507,7 @@ def main():
     parser.add_argument("-u", "--url")
     parser.add_argument("--reuse", action="store_true")
     parser.add_argument("--mtproto", action="store_true", help="Запустить отдельный checker MTProto proxy (tg://proxy / t.me/proxy)")
+    parser.add_argument("--mtproto-crypto", choices=["auto", "safe", "unsafe"], default=None, help="Crypto backend для MTProto: auto/safe/unsafe")
     
     parser.add_argument("-t", "--timeout", type=int, default=GLOBAL_CFG['timeout'])
     parser.add_argument("-l", "--lport", type=int, default=GLOBAL_CFG['local_port_start'])

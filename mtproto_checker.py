@@ -10,6 +10,7 @@ import base64
 import binascii
 import html
 import logging
+import os
 import re
 import socket
 import time
@@ -18,7 +19,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-__version__ = "1.3.5"
+__version__ = "1.4.0"
+ALLOWED_CRYPTO_BACKENDS = {"auto", "safe", "unsafe"}
 
 try:
     from telethon import TelegramClient, connection, functions, utils
@@ -62,6 +64,7 @@ STANDARD_SECRET_HEX_LEN = 32
 DD_SECRET_HEX_LEN = 34
 QUIET_TELETHON_LOGGER_NAME = "mk_xraychecker.mtproto.telethon"
 DEFAULT_DC_PROBE_LIMIT = 3
+SAFE_CRYPTO_ENV_VAR = "MK_MTPROTO_ALLOW_UNSAFE_CRYPTG"
 TELEGRAM_DC_OPTIONS = [
     {"dc_id": 4, "host": "149.154.167.91", "port": 443},
     {"dc_id": 2, "host": "149.154.167.51", "port": 443},
@@ -98,6 +101,158 @@ def _get_quiet_telethon_logger():
     logger.handlers.clear()
     logger.addHandler(logging.NullHandler())
     return logger
+
+
+def _env_flag_enabled(name):
+    value = str(os.environ.get(name) or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _get_telethon_aes_module():
+    if not TELETHON_AVAILABLE:
+        return None
+
+    try:
+        from telethon.crypto import aes as telethon_aes
+    except Exception:
+        return None
+    return telethon_aes
+
+
+def _get_cryptg_module():
+    try:
+        import cryptg
+    except Exception:
+        return None
+    return cryptg
+
+
+def _configure_telethon_crypto(mode):
+    telethon_aes = _get_telethon_aes_module()
+    if telethon_aes is None:
+        return None
+
+    if mode == "unsafe":
+        telethon_aes.cryptg = _get_cryptg_module()
+    else:
+        telethon_aes.cryptg = None
+
+    return telethon_aes
+
+
+def _entries_need_safe_crypto(entries):
+    if not entries:
+        return False
+
+    for entry in entries:
+        if isinstance(entry, dict) and str(entry.get("secret_mode") or "").lower() == "ee":
+            return True
+    return False
+
+
+def _resolve_crypto_backend(runtime_cfg, entries=None):
+    requested = str((runtime_cfg or {}).get("crypto_backend", "auto") or "auto").strip().lower()
+    if requested not in ALLOWED_CRYPTO_BACKENDS:
+        requested = "auto"
+
+    cryptg_available = _get_cryptg_module() is not None
+    if requested == "safe":
+        return {
+            "requested": requested,
+            "effective": "safe",
+            "cryptg_available": cryptg_available,
+            "reason": "forced safe mode",
+        }
+
+    if requested == "unsafe":
+        if cryptg_available:
+            return {
+                "requested": requested,
+                "effective": "unsafe",
+                "cryptg_available": True,
+                "reason": "forced unsafe mode",
+            }
+        return {
+            "requested": requested,
+            "effective": "safe",
+            "cryptg_available": False,
+            "reason": "forced unsafe mode requested, but cryptg is unavailable",
+        }
+
+    if _env_flag_enabled(SAFE_CRYPTO_ENV_VAR):
+        if cryptg_available:
+            return {
+                "requested": requested,
+                "effective": "unsafe",
+                "cryptg_available": True,
+                "reason": f"legacy env override {SAFE_CRYPTO_ENV_VAR}=1",
+            }
+        return {
+            "requested": requested,
+            "effective": "safe",
+            "cryptg_available": False,
+            "reason": f"legacy env override requested unsafe, but cryptg is unavailable",
+        }
+
+    if not cryptg_available:
+        return {
+            "requested": requested,
+            "effective": "safe",
+            "cryptg_available": False,
+            "reason": "cryptg not installed",
+        }
+
+    if _entries_need_safe_crypto(entries):
+        return {
+            "requested": requested,
+            "effective": "safe",
+            "cryptg_available": True,
+            "reason": "FakeTLS entries detected",
+        }
+
+    if os.name != "nt":
+        return {
+            "requested": requested,
+            "effective": "safe",
+            "cryptg_available": True,
+            "reason": f"conservative auto mode on {os.name}",
+        }
+
+    return {
+        "requested": requested,
+        "effective": "unsafe",
+        "cryptg_available": True,
+        "reason": "cryptg available on Windows without FakeTLS entries",
+    }
+
+
+def describe_crypto_backend(runtime_cfg, entries=None):
+    resolved = _resolve_crypto_backend(runtime_cfg, entries=entries)
+    requested = resolved["requested"]
+    effective = resolved["effective"]
+    reason = resolved["reason"]
+    if requested == effective:
+        return f"{effective} ({reason})"
+    return f"{requested} -> {effective} ({reason})"
+
+
+def configure_runtime_crypto_backend(runtime_cfg, entries=None):
+    resolved = _resolve_crypto_backend(runtime_cfg, entries=entries)
+    _configure_telethon_crypto(resolved["effective"])
+    return resolved
+
+
+def _configure_safe_telethon_crypto():
+    if not TELETHON_AVAILABLE:
+        return
+
+    if _env_flag_enabled(SAFE_CRYPTO_ENV_VAR):
+        return
+
+    _configure_telethon_crypto("safe")
+
+
+_configure_safe_telethon_crypto()
 
 
 def clean_mtproto_url(url):
@@ -379,10 +534,14 @@ def validate_runtime_config(runtime_cfg):
         api_id = 0
 
     api_hash = str(runtime_cfg.get("api_hash") or "").strip()
+    crypto_backend = str(runtime_cfg.get("crypto_backend", "auto") or "auto").strip().lower()
     if api_id <= 0:
         return False, "MTProto api_id не задан в config.json"
     if not api_hash:
         return False, "MTProto api_hash не задан в config.json"
+    if crypto_backend not in ALLOWED_CRYPTO_BACKENDS:
+        allowed = "/".join(sorted(ALLOWED_CRYPTO_BACKENDS))
+        return False, f"MTProto crypto_backend должен быть одним из: {allowed}"
     return True, None
 
 
@@ -542,29 +701,29 @@ async def _probe_mtproto_async(entry, runtime_cfg):
     for dc_candidate in dc_candidates:
         dc_id = dc_candidate.get("dc_id")
         for transport_name, connection_cls in candidates:
-            client = TelegramClient(
-                None,
-                api_id,
-                api_hash,
-                connection=connection_cls,
-                proxy=(entry["server"], entry["port"], entry.get("telethon_secret", entry["secret"])),
-                timeout=timeout,
-                request_retries=0,
-                connection_retries=0,
-                retry_delay=0,
-                auto_reconnect=False,
-                receive_updates=False,
-                sequential_updates=False,
-                device_model="MK_XRAYchecker",
-                app_version="mtproto-checker",
-                system_version="python",
-                lang_code="en",
-                system_lang_code="en",
-                base_logger=_get_quiet_telethon_logger(),
-            )
-
+            client = None
             start_time = time.perf_counter()
             try:
+                client = TelegramClient(
+                    None,
+                    api_id,
+                    api_hash,
+                    connection=connection_cls,
+                    proxy=(entry["server"], entry["port"], entry.get("telethon_secret", entry["secret"])),
+                    timeout=timeout,
+                    request_retries=0,
+                    connection_retries=0,
+                    retry_delay=0,
+                    auto_reconnect=False,
+                    receive_updates=False,
+                    sequential_updates=False,
+                    device_model="MK_XRAYchecker",
+                    app_version="mtproto-checker",
+                    system_version="python",
+                    lang_code="en",
+                    system_lang_code="en",
+                    base_logger=_get_quiet_telethon_logger(),
+                )
                 await _connect_sender_only(client, timeout, dc_candidate=dc_candidate)
                 connect_ping_ms = round((time.perf_counter() - start_time) * 1000)
                 if not client.is_connected():
@@ -600,23 +759,24 @@ async def _probe_mtproto_async(entry, runtime_cfg):
                     raise
                 last_error = f"dc{dc_id}/{transport_name}: {_format_probe_error(exc)}"
             finally:
-                try:
-                    await client.disconnect()
-                    await asyncio.sleep(0)
-                except BaseException as exc:
-                    if _should_reraise_base_exception(exc):
-                        raise
-                    disconnect_error = _format_probe_error(exc)
-                    if best_connect_only is None:
-                        best_connect_only = {
-                            "entry": entry,
-                            "ping_ms": None,
-                            "status": "fail",
-                            "error": f"disconnect failed: {disconnect_error}",
-                            "transport": transport_name,
-                            "dc_id": dc_id,
-                        }
-                    last_error = f"dc{dc_id}/{transport_name}: disconnect failed: {disconnect_error}"
+                if client is not None:
+                    try:
+                        await client.disconnect()
+                        await asyncio.sleep(0)
+                    except BaseException as exc:
+                        if _should_reraise_base_exception(exc):
+                            raise
+                        disconnect_error = _format_probe_error(exc)
+                        if best_connect_only is None:
+                            best_connect_only = {
+                                "entry": entry,
+                                "ping_ms": None,
+                                "status": "fail",
+                                "error": f"disconnect failed: {disconnect_error}",
+                                "transport": transport_name,
+                                "dc_id": dc_id,
+                            }
+                        last_error = f"dc{dc_id}/{transport_name}: disconnect failed: {disconnect_error}"
 
     if best_connect_only is not None:
         return best_connect_only
@@ -654,7 +814,9 @@ def _probe_mtproto_sync(entry, runtime_cfg):
     finally:
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
-        except Exception:
+        except BaseException as exc:
+            if _should_reraise_base_exception(exc):
+                raise
             pass
         asyncio.set_event_loop(None)
         loop.close()
@@ -664,6 +826,9 @@ def run_mtproto_check(entries, runtime_cfg, log_func=None, progress_callback=Non
     ok, error = validate_runtime_config(runtime_cfg)
     if not ok:
         raise RuntimeError(error)
+
+    resolved_crypto = configure_runtime_crypto_backend(runtime_cfg, entries=entries)
+    runtime_cfg["_resolved_crypto_backend"] = resolved_crypto
 
     max_ping_ms = int(runtime_cfg.get("max_ping_ms") or 0)
     threads = int(runtime_cfg.get("threads") or 1)

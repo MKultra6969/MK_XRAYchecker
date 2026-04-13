@@ -8,7 +8,7 @@
 
 <p>
   <a href="https://github.com/MKultra6969/MK_XRAYchecker">
-    <img src="https://img.shields.io/badge/VERSION-1.3.5-magenta?style=for-the-badge&logo=python" alt="Version">
+    <img src="https://img.shields.io/badge/VERSION-1.4.0-magenta?style=for-the-badge&logo=python" alt="Version">
   </a>
   <a href="http://www.wtfpl.net/">
     <img src="https://img.shields.io/badge/LICENSE-WTFPL-red?style=for-the-badge" alt="License">
@@ -166,6 +166,7 @@ python v2rayChecker.py --no-update
   - `timeout`: таймаут MTProto probe в секундах.
   - `max_ping_ms`: отдельный ping-порог для MTProto.
   - `dc_probe_limit`: сколько лучших Telegram DC пробовать для одного MTProto proxy.
+  - `crypto_backend`: режим crypto backend для MTProto: `auto` / `safe` / `unsafe`.
   - `output_file`: отдельный output-файл, например `sortedMtproto.txt`.
 
 > ⚠️ `api_id` и `api_hash` лежат в `config.json` в открытом виде.
@@ -229,6 +230,7 @@ MTProto checker работает отдельно от Xray/Mihomo:
   "timeout": 5,
   "max_ping_ms": 1500,
   "dc_probe_limit": 3,
+  "crypto_backend": "auto",
   "output_file": "sortedMtproto.txt"
 }
 ```
@@ -244,6 +246,7 @@ MTProto checker работает отдельно от Xray/Mihomo:
 | `-u`, `--url` | URL ссылка на подписку или список (v1.1.3)|
 | `--agg` | Запустить встроенный агрегатор (граббер) прокси |
 | `--mtproto` | Запустить отдельный checker MTProto proxy (`tg://proxy`, `t.me/proxy`) |
+| `--mtproto-crypto` | Принудительный выбор MTProto crypto backend: `auto` / `safe` / `unsafe` |
 | `--agg-cats` | Категории источников для агрегатора (например: `1 2`) |
 | `--agg-filter` | Фильтр агрегатора по ключевым словам (например: `vless reality`) |
 | `--agg-country` | Фильтр агрегатора по странам ISO2 (например: `RU DE GB`) (v1.1.4)|

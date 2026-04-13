@@ -10,7 +10,7 @@ import time
 
 from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomizedIntermediate
 
-__version__ = "1.3.5"
+__version__ = "1.4.0"
 
 P25519 = 2 ** 255 - 19
 BASE64_URLSAFE_RE = re.compile(r"[^a-zA-Z0-9+/_-]+")
