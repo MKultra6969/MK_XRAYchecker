@@ -2,6 +2,20 @@
 
 Почти все изменения проекта будут документироваться в этом файле.
 
+## [1.4.1] - 04-15-2026
+
+### Added
+- Telegram checker теперь поддерживает `tg://socks` / `t.me/socks`.
+
+### Fixed
+- MTProto `safe` mode теперь отключает не только `cryptg`, но и native `libssl` backend Telethon, чтобы битый FakeTLS/MTProto поток не валил процесс через OpenSSL assertion. #9
+- Для входящих MTProto пакетов добавлена проверка длины ciphertext перед AES-IGE decrypt, чтобы некратный 16 буфер завершался обычным `FAIL`, а не hard-crash процесса. #9 #7
+- Если preferred MTProto DC не сработали, checker теперь автоматически добирает оставшиеся Telegram DC вместо раннего ложного `Timeout/FAIL` на живом proxy. #9
+- Известный asyncio-шум `Future exception was never retrieved` для уже обработанного misaligned MTProto ciphertext подавляется, а причина показывается в человекочитаемом виде.
+- На Windows подавлен `asyncio Proactor` traceback на `ConnectionResetError [WinError 10054]` во время `_call_connection_lost()`, если это уже обработанное закрытие MTProto transport, а не реальный сбой проверки.
+- Telegram checker теперь явно показывает, сколько `proxy`-ссылок было найдено всего, и отдельно считает `MTProto` и `SOCKS`, чтобы mixed-файлы не выглядели как “пропавшие” прокси.
+- Для `ee/FakeTLS` checker теперь перебирает несколько MTProxy transport (`randomized`, `intermediate`, `abridged`) вместо жёсткой привязки к одному codec, поэтому живые proxy с нестандартным transport больше не застревают в ложном `CONN`. #9
+
 ## [1.4.0] - 04-13-2026
 
 ### Changed

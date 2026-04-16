@@ -18,7 +18,7 @@ from datetime import datetime
 # ВЕРСИЯ И КОНФИГУРАЦИЯ
 # Эта версия используется для сравнения с GitHub releases
 # ═══════════════════════════════════════════════════════════════════════════
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 # Настройки репо по умолчанию (можно переопределить через config.json)
 DEFAULT_REPO = {
@@ -400,7 +400,6 @@ def apply_pending_update_if_any():
         
         _safe_print(f"[bold cyan][UPDATER][/]: Применение обновления до версии {version}...")
 
-        # Сначала проверяем, что все staged-файлы на месте.
         missing_new = []
         for filename in files:
             new_path = os.path.join(script_dir, f"{filename}.new")
@@ -409,7 +408,6 @@ def apply_pending_update_if_any():
 
         if missing_new:
             _safe_print(f"[red][UPDATER] Не найдены staged-файлы: {missing_new}[/]")
-            # Возможный кейс: прошлый apply был прерван. Пытаемся восстановить из backup.
             _rollback_applied_files(script_dir, files)
             _cleanup_backups(script_dir, files)
             _write_failed_marker(script_dir, pending_info, "missing_staged_files", "\n".join(missing_new))
@@ -446,7 +444,6 @@ def apply_pending_update_if_any():
                 pass
             return False
 
-        # После замены файлов: устанавливаем зависимости и делаем smoke-check.
         dep_ok, dep_msg = _install_requirements_if_present(script_dir)
         if dep_ok:
             _safe_print("[green][UPDATER] Зависимости проверены/установлены[/]")
@@ -466,8 +463,6 @@ def apply_pending_update_if_any():
                 pass
             return False
 
-        # Если smoke-check успешен, даже при проблемах pip не откатываем:
-        # скрипт запускается, а зависимости можно дотянуть вручную.
         _cleanup_backups(script_dir, files)
         _cleanup_staged_files(script_dir, files)
         try:
@@ -580,7 +575,7 @@ if __name__ == "__main__":
         ("1.0.0", "1.0.1", True),
         ("1.0.0", "1.0.0", False),
         ("1.0.0", "0.9.9", False),
-        ("1.4.0", "2.0.0", True),
+        ("1.4.1", "2.0.0", True),
         ("v1.0.0", "1.0.1", True),
     ]
     

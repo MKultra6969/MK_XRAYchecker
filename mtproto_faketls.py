@@ -6,11 +6,14 @@ import os
 import random
 import re
 import socket
+import sys
 import time
 
+from telethon.network.connection.tcpabridged import AbridgedPacketCodec
+from telethon.network.connection.tcpintermediate import IntermediatePacketCodec
 from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomizedIntermediate
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 P25519 = 2 ** 255 - 19
 BASE64_URLSAFE_RE = re.compile(r"[^a-zA-Z0-9+/_-]+")
@@ -64,11 +67,19 @@ def _gen_x25519_public_key():
 
 
 class FakeTLSStreamReader:
-    __slots__ = ("upstream", "buf")
+    __slots__ = ("upstream", "buf", "trace_enabled", "trace_prefix")
 
-    def __init__(self, upstream):
+    def __init__(self, upstream, trace_enabled=False, trace_prefix=""):
         self.upstream = upstream
         self.buf = bytearray()
+        self.trace_enabled = trace_enabled
+        self.trace_prefix = trace_prefix
+
+    def _trace(self, message):
+        if not self.trace_enabled:
+            return
+        prefix = f" {self.trace_prefix}" if self.trace_prefix else ""
+        print(f"[FakeTLS-TRACE]{prefix} {message}", file=sys.stderr, flush=True)
 
     async def _read_tls_record(self, timeout=None):
         header = await asyncio.wait_for(self.upstream.readexactly(5), timeout=timeout)
@@ -103,18 +114,38 @@ class FakeTLSStreamReader:
         self.buf = self.buf[n:]
         return data
 
-    async def read_server_hello(self):
+    async def read_server_hello(self, timeout=None):
+        record_timeout = 10.0 if timeout is None else max(float(timeout), 10.0)
         try:
             records = []
-            tls_rec_type, record = await self._read_tls_record(timeout=10.0)
+            app_data_records = 0
+            record_index = 0
+            self._trace(f"read_server_hello start timeout={record_timeout}")
+            tls_rec_type, record = await self._read_tls_record(timeout=record_timeout)
+            record_index += 1
+            self._trace(
+                f"record#{record_index}: type=0x{tls_rec_type.hex()} len={int.from_bytes(record[3:5], 'big')}"
+            )
             if tls_rec_type != b"\x16":
                 raise ConnectionError(f"Unexpected first TLS record type: {tls_rec_type.hex()}")
             records.append(record)
 
             while True:
-                tls_rec_type, record = await self._read_tls_record(timeout=10.0)
+                tls_rec_type, record = await self._read_tls_record(timeout=record_timeout)
+                record_index += 1
+                self._trace(
+                    f"record#{record_index}: type=0x{tls_rec_type.hex()} len={int.from_bytes(record[3:5], 'big')}"
+                )
                 records.append(record)
                 if tls_rec_type == b"\x17":
+                    app_data_records += 1
+                    self.buf += record[5:]
+                    self._trace(
+                        f"handoff after {record_index} TLS records; app_data_records_before_handoff={app_data_records}"
+                    )
+                    self._trace(
+                        f"consumed app_data#{app_data_records}: payload_len={len(record) - 5} preview={record[5:21].hex()}"
+                    )
                     return b"".join(records)
                 if tls_rec_type != b"\x14":
                     raise ConnectionError(f"Unexpected TLS record type in server hello: {tls_rec_type.hex()}")
@@ -183,6 +214,7 @@ class MTProxyFakeTLSClientCodec:
 
         self.domain = full_secret[17:]
         self.secret = full_secret[1:17]
+        self.trace_enabled = os.environ.get("MK_XRAY_FAKE_TLS_TRACE") == "1"
         if not self.domain:
             raise ValueError("FakeTLS secret is missing domain")
 
@@ -356,6 +388,7 @@ class ConnectionTcpMTProxyFakeTLS(ConnectionTcpMTProxyRandomizedIntermediate):
         if len(proxy_host) > 60:
             proxy_host = socket.gethostbyname(proxy[0])
 
+        self._trace_label = f"{proxy_host}:{proxy[1]}"
         proxy = (proxy_host, proxy[1], self.fake_tls_codec.secret.hex())
         super().__init__(ip, port, dc_id, loggers=loggers, proxy=proxy, local_addr=local_addr)
 
@@ -389,11 +422,36 @@ class ConnectionTcpMTProxyFakeTLS(ConnectionTcpMTProxyRandomizedIntermediate):
         self._writer.write(self.fake_tls_codec.build_new_client_hello_packet())
         await self._writer.drain()
         self._writer = FakeTLSStreamWriter(self._writer)
-        self._reader = FakeTLSStreamReader(self._reader)
+        self._reader = FakeTLSStreamReader(
+            self._reader,
+            trace_enabled=self.fake_tls_codec.trace_enabled,
+            trace_prefix=self._trace_label,
+        )
 
-        if not self.fake_tls_codec.verify_server_hello(await self._reader.read_server_hello()):
+        if not self.fake_tls_codec.verify_server_hello(await self._reader.read_server_hello(timeout=timeout)):
             raise ConnectionError("FakeTLS server hello verification failed")
 
         self._codec = self.packet_codec(self)
         self._init_conn()
         await self._writer.drain()
+
+        # Give the proxy a brief chance to reject an incompatible packet codec
+        # right after the initial payload, mirroring Telethon's MTProxy logic.
+        try:
+            await asyncio.wait_for(self._reader.upstream._wait_for_data("proxy"), 2)
+        except asyncio.TimeoutError:
+            pass
+        except Exception:
+            await asyncio.sleep(2)
+
+        if self._reader.upstream.at_eof():
+            await self.disconnect()
+            raise ConnectionError("Proxy closed the connection after sending initial payload")
+
+
+class ConnectionTcpMTProxyFakeTLSIntermediate(ConnectionTcpMTProxyFakeTLS):
+    packet_codec = IntermediatePacketCodec
+
+
+class ConnectionTcpMTProxyFakeTLSAbridged(ConnectionTcpMTProxyFakeTLS):
+    packet_codec = AbridgedPacketCodec

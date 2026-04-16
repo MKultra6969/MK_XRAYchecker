@@ -19,7 +19,7 @@
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
 # +═════════════════════════════════════════════════════════════════════════+
-# ║                           VERSION 1.4.0                                 ║
+# ║                           VERSION 1.4.1                                 ║
 # ║             В случае багов/недочётов создайте issue на github           ║
 # ║                                                                         ║
 # +═════════════════════════════════════════════════════════════════════════+
@@ -61,7 +61,7 @@ YAML_WARNED = False
 
 # ВЕРСИЯ СКРИПТА
 # Формат: MAJOR.MINOR.PATCH (SemVer)
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 
 def _ensure_utf8_stdio():
@@ -2617,7 +2617,7 @@ def run_mtproto_logic(args):
         return
 
     if getattr(args, "mtproto_speed_flag_used", False):
-        safe_print("[yellow]MTProto mode: speed test и sort=speed не поддерживаются, используется сортировка только по ping[/]")
+        safe_print("[yellow]Telegram proxy mode: speed test и sort=speed не поддерживаются, используется сортировка только по ping[/]")
 
     ok, err = mtproto_checker.validate_runtime_config(runtime_cfg)
     if not ok:
@@ -2629,13 +2629,14 @@ def run_mtproto_logic(args):
     if args.file:
         fpath = args.file.strip('"')
         if os.path.exists(fpath):
-            safe_print(f"[cyan]>> Чтение MTProto файла: {fpath}[/]")
+            safe_print(f"[cyan]>> Чтение Telegram proxy файла: {fpath}[/]")
             with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
                 file_payload = f.read()
-            parsed_entries, raw_hits, invalid_count = mtproto_checker.parse_mtproto_content(file_payload)
+            parsed_entries, mtproto_hits, socks_hits, invalid_count, proxy_like_hits = mtproto_checker.parse_mtproto_content(file_payload)
             added_unique = _merge_mtproto_entries(entries_map, parsed_entries)
             safe_print(
-                f"[dim]>> MTProto ссылок в файле: {raw_hits}, "
+                f"[dim]>> Telegram proxy-ссылок в файле: {proxy_like_hits}, "
+                f"MTProto: {mtproto_hits}, SOCKS: {socks_hits}, "
                 f"invalid: {invalid_count}, добавлено уникальных: {added_unique}[/]"
             )
         else:
@@ -2644,38 +2645,40 @@ def run_mtproto_logic(args):
 
     if args.url:
         raw_url = args.url.strip()
-        if mtproto_checker.is_mtproto_link(raw_url):
+        if mtproto_checker.is_telegram_proxy_link(raw_url):
             parsed_entry, parse_error = mtproto_checker.parse_mtproto_url(raw_url)
             if not parsed_entry:
-                safe_print(f"[bold red]Некорректная MTProto ссылка:[/] {parse_error}")
+                safe_print(f"[bold red]Некорректная Telegram proxy ссылка:[/] {parse_error}")
                 return
             added_unique = _merge_mtproto_entries(entries_map, [parsed_entry])
-            safe_print(f"[dim]>> Прямая MTProto ссылка добавлена: {added_unique}[/]")
+            safe_print(f"[dim]>> Прямая Telegram proxy ссылка добавлена: {added_unique}[/]")
         else:
             try:
-                parsed_entries, raw_hits, invalid_count = mtproto_checker.fetch_mtproto_entries(
+                parsed_entries, mtproto_hits, socks_hits, invalid_count, proxy_like_hits = mtproto_checker.fetch_mtproto_entries(
                     raw_url,
                     timeout=max(int(runtime_cfg.get("timeout", 5)), 5),
                     log_func=safe_print
                 )
                 added_unique = _merge_mtproto_entries(entries_map, parsed_entries)
                 safe_print(
-                    f"[dim]>> Из URL получено MTProto ссылок: {raw_hits}, "
+                    f"[dim]>> Из URL получено Telegram proxy-ссылок: {proxy_like_hits}, "
+                    f"MTProto: {mtproto_hits}, SOCKS: {socks_hits}, "
                     f"invalid: {invalid_count}, добавлено уникальных: {added_unique}[/]"
                 )
             except Exception as e:
-                safe_print(f"[bold red]Ошибка загрузки MTProto URL:[/] {e}")
+                safe_print(f"[bold red]Ошибка загрузки Telegram proxy URL:[/] {e}")
                 return
 
     if getattr(args, "reuse", False):
         reuse_path = runtime_cfg["output_file"]
         if os.path.exists(reuse_path):
             with open(reuse_path, 'r', encoding='utf-8', errors='ignore') as f:
-                parsed_entries, raw_hits, invalid_count = mtproto_checker.parse_mtproto_content(f.read())
+                parsed_entries, mtproto_hits, socks_hits, invalid_count, proxy_like_hits = mtproto_checker.parse_mtproto_content(f.read())
             added_unique = _merge_mtproto_entries(entries_map, parsed_entries)
             safe_print(
-                f"[dim]>> Reuse MTProto: {raw_hits}, invalid: {invalid_count}, "
-                f"добавлено уникальных: {added_unique}[/]"
+                f"[dim]>> Reuse Telegram proxy: proxy-ссылок: {proxy_like_hits}, "
+                f"MTProto: {mtproto_hits}, SOCKS: {socks_hits}, "
+                f"invalid: {invalid_count}, добавлено уникальных: {added_unique}[/]"
             )
         else:
             safe_print(f"[yellow]Reuse-файл не найден: {reuse_path}[/]")
@@ -2692,15 +2695,18 @@ def run_mtproto_logic(args):
         except Exception:
             pass
 
-    safe_print(f"[dim]>> Уникальных MTProto прокси к проверке: {len(full)}[/]")
+    safe_print(f"[dim]>> Уникальных Telegram proxy к проверке: {len(full)}[/]")
     if not full:
-        safe_print("[bold red]Нет MTProto прокси для проверки.[/]")
+        safe_print("[bold red]Нет Telegram proxy для проверки.[/]")
         return
 
-    safe_print(f"[dim]MTProto crypto backend: {mtproto_checker.describe_crypto_backend(runtime_cfg, full)}[/]")
+    safe_print(f"[dim]Telegram proxy crypto backend: {mtproto_checker.describe_crypto_backend(runtime_cfg, full)}[/]")
 
-    dc_candidates = mtproto_checker.rank_telegram_dcs(limit=int(runtime_cfg.get("dc_probe_limit", 3) or 3))
+    all_dc_candidates = mtproto_checker.rank_telegram_dcs(limit=0)
+    dc_limit = int(runtime_cfg.get("dc_probe_limit", 3) or 3)
+    dc_candidates = all_dc_candidates[:dc_limit] if dc_limit > 0 else list(all_dc_candidates)
     runtime_cfg["dc_candidates"] = dc_candidates
+    runtime_cfg["all_dc_candidates"] = all_dc_candidates
 
     runtime_cfg["threads"] = min(int(runtime_cfg.get("threads", 1) or 1), len(full))
     if runtime_cfg["threads"] < 1:
@@ -2717,7 +2723,7 @@ def run_mtproto_logic(args):
     ]
 
     console.print(
-        f"\n[magenta]Запуск {runtime_cfg['threads']} MTProto воркеров "
+        f"\n[magenta]Запуск {runtime_cfg['threads']} Telegram proxy воркеров "
         f"для {len(full)} прокси...[/]"
     )
     if dc_candidates:
@@ -2726,13 +2732,13 @@ def run_mtproto_logic(args):
             + (f"({item['probe_ms']}ms)" if item.get("probe_ms") is not None else "")
             for item in dc_candidates
         )
-        console.print(f"[dim]MTProto DC order: {dc_desc}[/]")
+        console.print(f"[dim]Telegram DC order: {dc_desc}[/]")
     if runtime_cfg.get("max_ping_ms", 0) > 0:
-        console.print(f"[dim]Фильтр ping MTProto: <= {runtime_cfg['max_ping_ms']} ms[/]")
+        console.print(f"[dim]Фильтр ping Telegram proxy: <= {runtime_cfg['max_ping_ms']} ms[/]")
 
     mtproto_log_buffer = []
     with Progress(*progress_columns, console=console, transient=False) as progress:
-        task_id = progress.add_task("[cyan]Checking MTProto proxies...", total=len(full))
+        task_id = progress.add_task("[cyan]Checking Telegram proxies...", total=len(full))
         results, all_results = mtproto_checker.run_mtproto_check(
             full,
             runtime_cfg,
@@ -2750,13 +2756,17 @@ def run_mtproto_logic(args):
             f.write(item[0] + '\n')
 
     if results:
-        table = Table(title=f"MTProto Results (Топ 15 из {len(results)})", box=box.ROUNDED)
+        table = Table(title=f"Telegram proxy Results (Топ 15 из {len(results)})", box=box.ROUNDED)
         table.add_column("Ping", justify="right", style="green")
         table.add_column("Server", justify="left", overflow="fold")
 
         for item in results[:15]:
             parsed_entry, _ = mtproto_checker.parse_mtproto_url(item[0])
-            label = parsed_entry["label"] if parsed_entry else "mtproto"
+            if parsed_entry:
+                proxy_kind = parsed_entry.get("proxy_kind", "mtproto")
+                label = f"{parsed_entry['label']} [{proxy_kind}]"
+            else:
+                label = "telegram proxy"
             if len(label) > 50:
                 label = label[:47] + "..."
             table.add_row(f"{item[1]} ms", label)
@@ -2768,14 +2778,14 @@ def run_mtproto_logic(args):
     unreachable_count = len([item for item in all_results if item.get("status") == "proxy_unreachable"])
     failed_count = len([item for item in all_results if item.get("status") == "fail"])
     safe_print(
-        f"\n[bold green]MTProto готово! LIVE: {live_count}. "
+        f"\n[bold green]Telegram proxy готово! LIVE: {live_count}. "
         f"CONN: {connect_only_count}. DROP: {drop_count}. UNREACH: {unreachable_count}. FAIL: {failed_count}. "
         f"Результат в: {runtime_cfg['output_file']}[/]"
     )
     if runtime_cfg.get("max_ping_ms", 0) > 0 and drop_count > 0:
         safe_print(
-            f"[yellow]Подсказка:[/] {drop_count} MTProto proxy живы, но отфильтрованы по ping > "
-            f"{runtime_cfg['max_ping_ms']} ms. Для проверки именно живых прокси поставь `MTProto ping = 0`."
+            f"[yellow]Подсказка:[/] {drop_count} Telegram proxy живы, но отфильтрованы по ping > "
+            f"{runtime_cfg['max_ping_ms']} ms. Для проверки именно живых прокси поставь `Telegram proxy ping = 0`."
         )
 
 def run_logic(args):
@@ -3544,7 +3554,7 @@ def main():
             success = _self_test_clean_url()
             success = _self_test_subscription_url_parsing() and success
             if MTPROTO_AVAILABLE and mtproto_checker is not None:
-                print("Running MTProto parsing self-test...")
+                print("Running Telegram proxy parsing self-test...")
                 success = mtproto_checker.run_parser_self_test(log_func=safe_print) and success
             sys.exit(0 if success else 1)
         
