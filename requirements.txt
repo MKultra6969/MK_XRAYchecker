@@ -1,9 +1,0 @@
-requests
-psutil
-pysocks
-rich
-art
-pyyaml
-telethon
-urllib3
-colorama

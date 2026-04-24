@@ -1,8 +1,0 @@
-blank_issues_enabled: false
-contact_links:
-  - name: README / documentation
-    url: https://github.com/MKultra6969/MK_XRAYchecker#readme
-    about: Check the documentation and CLI arguments before opening an issue.
-  - name: Telegram
-    url: https://t.me/MKplusULTRA
-    about: For quick discussion and feedback.
