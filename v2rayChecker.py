@@ -19,7 +19,7 @@
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
 # +═════════════════════════════════════════════════════════════════════════+
-# ║                           VERSION 1.5.0                                 ║
+# ║                           VERSION 1.6.0                                 ║
 # ║             В случае багов/недочётов создайте issue на github           ║
 # ║                                                                         ║
 # +═════════════════════════════════════════════════════════════════════════+
@@ -61,7 +61,7 @@ YAML_WARNED = False
 
 # ВЕРСИЯ СКРИПТА
 # Формат: MAJOR.MINOR.PATCH (SemVer)
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 
 def _ensure_utf8_stdio():
@@ -339,6 +339,12 @@ DEFAULT_CONFIG = {
         "probe_policy": "balanced",
         "connect_retries": 1,
         "rpc_retries": 1,
+        "fetch_promo_data": True,
+        "promo_session_file": "mtproto_promo",
+        "promo_output_file": "sortedMtproto.promo.json",
+        "promo_threads": 3,
+        "promo_timeout": 6,
+        "promo_probe_limit": 50,
         "save_connect_only": True,
         "connect_only_output_file": "sortedMtproto.conn.txt",
         "debug_attempts": False,
@@ -2564,7 +2570,7 @@ def _arg_was_provided(*flags):
 
 
 def apply_mtproto_arg_defaults(args):
-    if not getattr(args, "mtproto", False):
+    if not (getattr(args, "mtproto", False) or getattr(args, "mtproto_login", False)):
         return args
 
     mt_cfg = get_mtproto_config(GLOBAL_CFG)
@@ -2598,6 +2604,60 @@ def _derive_mtproto_sidecar_path(output_file, suffix=".conn.txt"):
     return f"{output_file}{suffix}"
 
 
+def _build_mtproto_promo_lookup(all_results):
+    promo_by_proxy = {}
+    for result in all_results or []:
+        if not isinstance(result, dict):
+            continue
+        entry = result.get("entry")
+        if not isinstance(entry, dict):
+            continue
+        proxy_url = entry.get("canonical_url") or entry.get("original_url")
+        if proxy_url:
+            promo_by_proxy[proxy_url] = result.get("promo_data")
+    return promo_by_proxy
+
+
+def _format_mtproto_promo_summary(summary):
+    if not isinstance(summary, dict):
+        return ""
+    unknown = int(summary.get("unknown") or 0)
+    unknown_suffix = f", UNKNOWN: {unknown}" if unknown else ""
+    return (
+        f"PROMO: {int(summary.get('present') or 0)} found, "
+        f"{int(summary.get('empty') or 0)} empty, "
+        f"{int(summary.get('error') or 0)} errors, "
+        f"{int(summary.get('unsupported') or 0)} unsupported, "
+        f"{int(summary.get('auth_required') or 0)} auth required"
+        f", {int(summary.get('skipped') or 0)} skipped"
+        f"{unknown_suffix}"
+    )
+
+
+def _build_mtproto_login_callbacks():
+    phone_value = Prompt.ask("[cyan][?][/] Телефон Telegram в международном формате")
+
+    def code_callback():
+        return Prompt.ask("[cyan][?][/] Код Telegram")
+
+    def password_callback():
+        return Prompt.ask("[cyan][?][/] Пароль 2FA Telegram", password=True)
+
+    return phone_value, code_callback, password_callback
+
+
+def _decorate_mtproto_promo_logs(log_lines, all_results):
+    decorated = []
+    for index, log_line in enumerate(log_lines or []):
+        line = str(log_line)
+        result = all_results[index] if index < len(all_results or []) else None
+        if isinstance(result, dict) and result.get("status") == "live" and " | Promo:" not in line:
+            promo_label = mtproto_checker.format_promo_display(result.get("promo_data")) or "unknown"
+            line = f"{line} | Promo: {promo_label}"
+        decorated.append(line)
+    return decorated
+
+
 def build_mtproto_runtime_cfg(args):
     runtime_cfg = get_mtproto_config(GLOBAL_CFG)
     runtime_cfg["threads"] = max(1, int(getattr(args, "threads", runtime_cfg.get("threads", 20)) or 1))
@@ -2607,6 +2667,19 @@ def build_mtproto_runtime_cfg(args):
     runtime_cfg["probe_policy"] = str(runtime_cfg.get("probe_policy", "balanced") or "balanced").strip().lower()
     runtime_cfg["connect_retries"] = max(0, min(3, int(runtime_cfg.get("connect_retries", 1) or 0)))
     runtime_cfg["rpc_retries"] = max(0, min(3, int(runtime_cfg.get("rpc_retries", 1) or 0)))
+    runtime_cfg["fetch_promo_data"] = _bool_value(runtime_cfg.get("fetch_promo_data", True), True)
+    runtime_cfg["promo_session_file"] = str(runtime_cfg.get("promo_session_file") or "mtproto_promo")
+    runtime_cfg["promo_threads"] = max(
+        1,
+        min(8, int(runtime_cfg.get("promo_threads", runtime_cfg.get("promo_parallelism", 3)) or 1)),
+    )
+    runtime_cfg["promo_parallelism"] = runtime_cfg["promo_threads"]
+    runtime_cfg["promo_timeout"] = max(1, int(runtime_cfg.get("promo_timeout", min(runtime_cfg["timeout"], 6)) or 1))
+    runtime_cfg["promo_probe_limit"] = max(
+        0,
+        int(runtime_cfg.get("promo_probe_limit", runtime_cfg.get("promo_limit", 0)) or 0),
+    )
+    runtime_cfg["promo_limit"] = runtime_cfg["promo_probe_limit"]
     runtime_cfg["save_connect_only"] = _bool_value(runtime_cfg.get("save_connect_only", True), True)
     runtime_cfg["debug_attempts"] = _bool_value(runtime_cfg.get("debug_attempts", False), False)
     runtime_cfg["crypto_backend"] = str(
@@ -2621,6 +2694,10 @@ def build_mtproto_runtime_cfg(args):
     runtime_cfg["attempts_output_file"] = str(
         runtime_cfg.get("attempts_output_file")
         or _derive_mtproto_sidecar_path(runtime_cfg["output_file"], ".attempts.json")
+    )
+    runtime_cfg["promo_output_file"] = str(
+        runtime_cfg.get("promo_output_file")
+        or _derive_mtproto_sidecar_path(runtime_cfg["output_file"], ".promo.json")
     )
     return runtime_cfg
 
@@ -2774,7 +2851,16 @@ def run_mtproto_logic(args):
             progress_callback=lambda: progress.advance(task_id, 1)
         )
 
-    for log_line in mtproto_log_buffer:
+    if runtime_cfg.get("fetch_promo_data", True):
+        promo_limit = int(runtime_cfg.get("promo_probe_limit", 0) or 0)
+        limit_suffix = f", limit={promo_limit}" if promo_limit > 0 else ""
+        safe_print(
+            f"[dim]MTProto promo enrichment: threads={runtime_cfg.get('promo_threads', 1)}, "
+            f"timeout={runtime_cfg.get('promo_timeout', runtime_cfg.get('timeout'))}s{limit_suffix}...[/]"
+        )
+        mtproto_checker.enrich_promo_results(all_results, runtime_cfg)
+
+    for log_line in _decorate_mtproto_promo_logs(mtproto_log_buffer, all_results):
         safe_print(log_line)
 
     results.sort(key=lambda x: x[1])
@@ -2825,10 +2911,24 @@ def run_mtproto_logic(args):
         mtproto_checker.write_attempt_diagnostics(runtime_cfg["attempts_output_file"], all_results)
         safe_print(f"[dim]MTProto attempt diagnostics: {runtime_cfg['attempts_output_file']}[/]")
 
+    promo_summary_text = ""
+    if runtime_cfg.get("fetch_promo_data", True):
+        promo_summary = mtproto_checker.summarize_promo_results(all_results)
+        mtproto_checker.write_promo_diagnostics(runtime_cfg["promo_output_file"], all_results)
+        promo_summary_text = _format_mtproto_promo_summary(promo_summary)
+        safe_print(f"[dim]MTProto promo data: {runtime_cfg['promo_output_file']}[/]")
+        if int(promo_summary.get("auth_required") or 0) > 0:
+            safe_print(
+                "[yellow]MTProto promo требует авторизованную session: "
+                "запусти `python v2rayChecker.py --mtproto-login` один раз.[/]"
+            )
+
     if results:
+        promo_by_proxy = _build_mtproto_promo_lookup(all_results)
         table = Table(title=f"Telegram proxy Results (Топ 15 из {len(results)})", box=box.ROUNDED)
         table.add_column("Ping", justify="right", style="green")
         table.add_column("Server", justify="left", overflow="fold")
+        table.add_column("Promo", justify="left", overflow="fold")
 
         for item in results[:15]:
             parsed_entry, _ = mtproto_checker.parse_mtproto_url(item[0])
@@ -2839,7 +2939,12 @@ def run_mtproto_logic(args):
                 label = "telegram proxy"
             if len(label) > 50:
                 label = label[:47] + "..."
-            table.add_row(f"{item[1]} ms", label)
+            promo_label = (
+                mtproto_checker.format_promo_display(promo_by_proxy.get(item[0]))
+                if runtime_cfg.get("fetch_promo_data", True)
+                else "off"
+            )
+            table.add_row(f"{item[1]} ms", label, promo_label or "unknown")
         console.print(table)
 
     conn_suffix = (
@@ -2851,6 +2956,7 @@ def run_mtproto_logic(args):
         f"\n[bold green]Telegram proxy готово! LIVE: {live_count}. "
         f"CONN: {connect_only_count}. DROP: {drop_count}. UNREACH: {unreachable_count}. "
         f"SOFT: {soft_fail_count}. FAIL: {failed_count}. "
+        f"{promo_summary_text + '. ' if promo_summary_text else ''}"
         f"Результат в: {runtime_cfg['output_file']}.{conn_suffix}[/]"
     )
     if runtime_cfg.get("max_ping_ms", 0) > 0 and drop_count > 0:
@@ -2859,8 +2965,71 @@ def run_mtproto_logic(args):
             f"{runtime_cfg['max_ping_ms']} ms. Для проверки именно живых прокси поставь `Telegram proxy ping = 0`."
         )
 
+
+def run_mtproto_login_logic(args):
+    if not MTPROTO_AVAILABLE or mtproto_checker is None:
+        safe_print("[bold red]MTProto checker module не найден.[/]")
+        return
+
+    runtime_cfg = build_mtproto_runtime_cfg(args)
+    ok, err = mtproto_checker.validate_runtime_config(runtime_cfg)
+    if not ok:
+        safe_print(f"[bold red]MTProto config error:[/] {err}")
+        return
+
+    proxy_entry = None
+    if getattr(args, "url", None):
+        raw_url = args.url.strip()
+        if mtproto_checker.is_telegram_proxy_link(raw_url):
+            proxy_entry, parse_error = mtproto_checker.parse_mtproto_url(raw_url)
+            if not proxy_entry:
+                safe_print(f"[bold red]Некорректная Telegram proxy ссылка для login:[/] {parse_error}")
+                return
+        else:
+            safe_print("[yellow]--mtproto-login использует -u только если это tg://proxy или t.me/proxy ссылка; login будет напрямую[/]")
+
+    session_file = runtime_cfg.get("promo_session_file", "mtproto_promo")
+    safe_print(f"[cyan]MTProto promo login: session file = {session_file}.session[/]")
+    if proxy_entry:
+        safe_print(f"[cyan]MTProto promo login через proxy: {proxy_entry.get('label')}[/]")
+    else:
+        safe_print("[cyan]MTProto promo login напрямую к Telegram[/]")
+    safe_print("[dim]Telegram active session будет отображаться как MK_XrayChecker[/]")
+
+    if not Confirm.ask(
+        "Подтверждаю: использую свой аккаунт, не для спама/скама, не для AI/data scraping, "
+        "понимаю риск ограничений Telegram при нарушении ToS",
+        default=False,
+    ):
+        safe_print("[yellow]MTProto promo login отменён.[/]")
+        return
+
+    phone, code_callback, password_callback = _build_mtproto_login_callbacks()
+
+    try:
+        result = mtproto_checker.login_promo_session(
+            runtime_cfg,
+            proxy_entry=proxy_entry,
+            phone=phone,
+            code_callback=code_callback,
+            password=password_callback,
+        )
+    except Exception as exc:
+        safe_print(f"[bold red]MTProto promo login failed:[/] {exc}")
+        return
+
+    username = result.get("username")
+    name = result.get("name")
+    user_label = f"@{username}" if username else (name or result.get("user_id") or "authorized user")
+    safe_print(f"[green]✓ MTProto promo session authorized: {user_label}. Теперь можно запускать --mtproto.[/]")
+
+
 def run_logic(args):
     global CORE_PATH, CORE_FLAVOR, CTRL_C
+
+    if getattr(args, "mtproto_login", False):
+        run_mtproto_login_logic(args)
+        return
 
     if getattr(args, "mtproto", False):
         run_mtproto_logic(args)
@@ -3333,7 +3502,8 @@ def _build_interactive_defaults():
         "speed_test_url": GLOBAL_CFG['speed_test_url'],
         "sort_by": GLOBAL_CFG['sort_by'],
         "menu": True,
-        "mtproto": False
+        "mtproto": False,
+        "mtproto_login": False,
     }
 
 
@@ -3472,6 +3642,7 @@ def interactive_menu():
                 ("4", "Crypto MTProto", str(mt_cfg.get("crypto_backend", "auto"))),
                 ("5", "Probe MTProto", f"{mt_cfg.get('probe_policy', 'balanced')} ({mt_cfg.get('connect_retries', 1)}/{mt_cfg.get('rpc_retries', 1)})"),
                 ("6", "CONN MTProto", "save" if _bool_value(mt_cfg.get("save_connect_only", True), True) else "off"),
+                ("7", "Login MTProto", "Авторизовать session для Promo"),
                 ("0", "Назад", "Вернуться в главное меню"),
             ]
             action = _render_interactive_menu("Настройки", settings_rows)
@@ -3611,6 +3782,18 @@ def interactive_menu():
                 time.sleep(1.0)
                 continue
 
+            if action == "7":
+                args = SimpleNamespace(**_build_interactive_defaults())
+                args.mtproto_login = True
+                args.mtproto = False
+                if Confirm.ask("Логиниться через конкретный MTProto proxy?", default=False):
+                    args.url = Prompt.ask("[cyan][?][/] MTProto proxy ссылка").strip()
+                    if not args.url:
+                        continue
+                run_mtproto_login_logic(args)
+                Prompt.ask("\n[bold]Нажмите Enter чтобы вернуться в меню...[/]", password=False)
+                continue
+
         if main_choice == "3":
             service_rows = [
                 ("1", "Сброс ядер", "Убить все процессы xray/mihomo"),
@@ -3649,6 +3832,7 @@ def main():
     parser.add_argument("-u", "--url")
     parser.add_argument("--reuse", action="store_true")
     parser.add_argument("--mtproto", action="store_true", help="Запустить отдельный checker MTProto proxy (tg://proxy / t.me/proxy)")
+    parser.add_argument("--mtproto-login", action="store_true", help="Один раз авторизовать Telethon session для MTProto promo data")
     parser.add_argument("--mtproto-crypto", choices=["auto", "safe", "unsafe"], default=None, help="Crypto backend для MTProto: auto/safe/unsafe")
     
     parser.add_argument("-t", "--timeout", type=int, default=GLOBAL_CFG['timeout'])

@@ -8,7 +8,7 @@
 
 <p>
   <a href="https://github.com/MKultra6969/MK_XRAYchecker">
-    <img src="https://img.shields.io/badge/VERSION-1.5.0-magenta?style=for-the-badge&logo=python" alt="Version">
+    <img src="https://img.shields.io/badge/VERSION-1.6.0-magenta?style=for-the-badge&logo=python" alt="Version">
   </a>
   <a href="http://www.wtfpl.net/">
     <img src="https://img.shields.io/badge/LICENSE-WTFPL-red?style=for-the-badge" alt="License">
@@ -33,6 +33,7 @@
 ### 🔥 Возможности
 *   **Поддержка протоколов:** `VMess`, `VLESS`, `Trojan`, `Shadowsocks`, `Hysteria2`.
 *   **Отдельный MTProto checker:** проверка Telegram proxy (`tg://proxy`, `t.me/proxy`) через реальный MTProto handshake и Telegram RPC probe.
+*   **MTProto Promo:** умеет читать `help.getPromoData` через авторизованную Telethon session и показывать promo-канал в логе, таблице и sidecar JSON.
 *   **Парсинг:** Извлекает прокси из "каши" текста, Base64 строк, ссылок-подписок. 
 *   **Подписки:** Поддерживает URL-подписки в формате ссылок и `Clash/Mihomo` YAML (`proxies:`), включая Base64-обёртку.
     - (Ну, то есть скрипту практически похуй в каком виде ты скормишь ему ссылки.)
@@ -52,6 +53,7 @@
 *   **Auto-install core:** умеет автоматически ставить `xray` или `mihomo` (по `preferred_core`) в `./bin`.
 *   **Свитч ядра:** переключение `auto/xray/mihomo` через CLI (`--engine`) или через интерактивное меню.
 *   **MTProto в отдельном режиме:** свой output-файл, свой timeout/threads/max ping, свой пункт в меню.
+*   **MTProto Login:** отдельный CLI/TUI вход для promo data с поддержкой Telegram-кода и 2FA-пароля.
 
 ---
 
@@ -131,6 +133,9 @@ python v2rayChecker.py -f "list.txt" -T 50 -t 2
 # MTProto checker по файлу
 python v2rayChecker.py --mtproto -f "mtproto.txt"
 
+# Один раз авторизовать session для MTProto Promo
+python v2rayChecker.py --mtproto-login
+
 # MTProto checker по прямой ссылке
 python v2rayChecker.py --mtproto -u "tg://proxy?server=1.2.3.4&port=443&secret=0123456789abcdef0123456789abcdef"
 
@@ -170,6 +175,12 @@ python v2rayChecker.py --no-update
   - `probe_policy`: политика проверки MTProto: `strict`, `balanced` или `telegram_like`.
   - `connect_retries`: число повторов для MTProto connect при временных сетевых сбоях.
   - `rpc_retries`: число повторов Telegram RPC probe после успешного connect.
+  - `fetch_promo_data`: запрашивать `help.getPromoData` для живых Telegram proxy.
+  - `promo_session_file`: Telethon session-файл авторизованного аккаунта для `help.getPromoData`, по умолчанию `mtproto_promo`.
+  - `promo_output_file`: JSON sidecar с полными promo-данными, например `sortedMtproto.promo.json`.
+  - `promo_threads`: сколько promo-запросов делать параллельно после проверки live proxy.
+  - `promo_timeout`: отдельный таймаут promo-запроса в секундах.
+  - `promo_probe_limit`: сколько live proxy обогащать promo-данными (`0` = все).
   - `save_connect_only`: сохранять `CONN` в отдельный sidecar-файл `sortedMtproto.conn.txt`.
   - `output_file`: основной output-файл для `LIVE`, например `sortedMtproto.txt`.
 
@@ -212,7 +223,21 @@ MTProto checker работает отдельно от Xray/Mihomo:
 - сортирует результаты только по ping;
 - не делает speed-test;
 - показывает отдельные статусы `LIVE / CONN / DROP / UNREACH / SOFT / FAIL`;
-- пишет `LIVE` в основной файл (`sortedMtproto.txt` по умолчанию), а `CONN` при `save_connect_only=true` складывает в sidecar `sortedMtproto.conn.txt`.
+- показывает найденный `Promo` статус/канал в live-логе и таблице результатов;
+- пишет `LIVE` в основной файл (`sortedMtproto.txt` по умолчанию), `CONN` при `save_connect_only=true` складывает в sidecar `sortedMtproto.conn.txt`, а promo-данные при `fetch_promo_data=true` пишет в `promo_output_file`.
+
+`help.getPromoData` требует авторизованную пользовательскую Telethon session. Без неё checker покажет `Promo: auth required`, а не будет считать proxy плохим. Для создания session один раз запусти:
+
+```bash
+python v2rayChecker.py --mtproto-login
+
+# Если Telegram напрямую недоступен, можно логиниться через конкретный MTProxy:
+python v2rayChecker.py --mtproto-login -u "tg://proxy?server=1.2.3.4&port=443&secret=..."
+```
+
+То же доступно в TUI: `Настройки` -> `Login MTProto`. При входе checker спросит телефон, код Telegram и, если на аккаунте включена 2FA, пароль. В активных сессиях Telegram этот вход подписывается как `MK_XrayChecker`.
+
+Перед login checker показывает ToS-подтверждение: использовать только свой аккаунт, не применять данные для спама/скама, AI/data scraping или обхода правил Telegram. По умолчанию promo enrichment ограничен `promo_threads=3` и `promo_probe_limit=50`; если нужен полный список, поставь `promo_probe_limit=0`, но это повышает нагрузку на аккаунт.
 
 Грубая интерпретация статусов:
 - `LIVE`: proxy прошёл MTProto connect и Telegram RPC probe.
@@ -248,6 +273,12 @@ MTProto checker работает отдельно от Xray/Mihomo:
   "probe_policy": "balanced",
   "connect_retries": 1,
   "rpc_retries": 1,
+  "fetch_promo_data": true,
+  "promo_session_file": "mtproto_promo",
+  "promo_output_file": "sortedMtproto.promo.json",
+  "promo_threads": 3,
+  "promo_timeout": 6,
+  "promo_probe_limit": 50,
   "save_connect_only": true,
   "connect_only_output_file": "sortedMtproto.conn.txt",
   "debug_attempts": false,
@@ -257,6 +288,8 @@ MTProto checker работает отдельно от Xray/Mihomo:
 ```
 
 Если `save_connect_only=true`, sidecar `sortedMtproto.conn.txt` хранит `CONN`-результаты отдельно от основного `sortedMtproto.txt`.
+
+`promo_output_file` хранит JSON-массив результатов с `proxy`, `label`, `status`, `ping_ms` и `promo_data`. В `promo_data` нормализуются `status`, `display`, `title`, `username`, `peer_id`, `psa_type`, `psa_message`, `expires`, `proxy`, `error`, а также найденные `chats` / `users`.
 
 ---
 
@@ -269,6 +302,7 @@ MTProto checker работает отдельно от Xray/Mihomo:
 | `-u`, `--url` | URL ссылка на подписку или список (v1.1.3)|
 | `--agg` | Запустить встроенный агрегатор (граббер) прокси |
 | `--mtproto` | Запустить отдельный checker MTProto proxy (`tg://proxy`, `t.me/proxy`) |
+| `--mtproto-login` | Авторизовать Telethon session для чтения MTProto promo data (v1.6.0) |
 | `--mtproto-crypto` | Принудительный выбор MTProto crypto backend: `auto` / `safe` / `unsafe` |
 | `--agg-cats` | Категории источников для агрегатора (например: `1 2`) |
 | `--agg-filter` | Фильтр агрегатора по ключевым словам (например: `vless reality`) |

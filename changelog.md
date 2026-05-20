@@ -2,6 +2,26 @@
 
 Почти все изменения проекта будут документироваться в этом файле.
 
+## [1.6.0] - 2026-05-20
+
+### Added
+- MTProto checker теперь умеет читать `help.getPromoData` для живых Telegram proxy и показывает результат в live-логе, колонке `Promo`, summary и sidecar JSON `sortedMtproto.promo.json`.
+- Добавлен авторизованный promo-session flow: CLI `--mtproto-login` и TUI-пункт `Настройки -> Login MTProto` создают Telethon session `mtproto_promo.session`, поддерживают код Telegram и 2FA-пароль.
+- Вход в Telegram подписывается как `MK_XrayChecker` в active sessions.
+- Для promo enrichment добавлены настройки `fetch_promo_data`, `promo_session_file`, `promo_output_file`, `promo_threads`, `promo_timeout` и `promo_probe_limit`.
+- Promo enrichment распараллелен через in-memory `StringSession`, чтобы не шарить SQLite session-файл между параллельными Telethon clients.
+
+### Changed
+- `help.getPromoData` больше не вызывается внутри unauthenticated liveness probe: сначала checker определяет `LIVE`, затем отдельным authenticated enrichment добавляет promo metadata.
+- Без авторизованной session promo теперь отображается как `auth required`, а не как шумный `AuthKeyUnregisteredError`.
+- Дефолты promo сделаны консервативнее: `promo_threads=3`, `promo_timeout=6`, `promo_probe_limit=50`; `promo_threads` ограничен максимумом 8.
+- Promo targets при лимите сортируются по `ping_ms`, чтобы сначала проверять самые быстрые live proxy.
+- Перед `--mtproto-login` добавлено явное ToS-подтверждение: свой аккаунт, без spam/scam и AI/data scraping.
+
+### Fixed
+- Убрано последовательное ожидание promo-запросов по всем live proxy: enrichment теперь использует bounded parallelism и отдельный timeout.
+- `is_user_authorized()` в promo path теперь ограничен timeout, чтобы зависшие proxy не блокировали весь этап.
+
 ## [1.5.0] - 2026-05-20
 
 ### Added

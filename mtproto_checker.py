@@ -21,7 +21,7 @@ from threading import Lock
 
 import requests
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 ALLOWED_CRYPTO_BACKENDS = {"auto", "safe", "unsafe"}
 ALLOWED_PROBE_POLICIES = {"strict", "balanced", "telegram_like"}
 PROBE_POLICY_DEFAULTS = {
@@ -31,8 +31,9 @@ PROBE_POLICY_DEFAULTS = {
 }
 
 try:
-    from telethon import TelegramClient, connection, functions, utils
+    from telethon import TelegramClient, connection, functions, types, utils
     from telethon.client.telegrambaseclient import DEFAULT_DC_ID, DEFAULT_IPV4_IP, DEFAULT_IPV6_IP, DEFAULT_PORT
+    from telethon.sessions import StringSession
     from telethon.tl.alltlobjects import LAYER
 
     TELETHON_AVAILABLE = True
@@ -41,7 +42,9 @@ except Exception as exc:
     TelegramClient = None
     connection = None
     functions = None
+    types = None
     utils = None
+    StringSession = None
     DEFAULT_DC_ID = None
     DEFAULT_IPV4_IP = None
     DEFAULT_IPV6_IP = None
@@ -1107,6 +1110,540 @@ async def _invoke_probe_request(client, timeout, probe_name="get_config"):
     )
 
 
+async def _invoke_promo_data_request(client, timeout):
+    request_cls = getattr(functions.help, "GetPromoDataRequest", None)
+    if request_cls is None:
+        return None
+
+    return await asyncio.wait_for(client(request_cls()), timeout=timeout)
+
+
+def _datetime_to_json(value):
+    if value is None:
+        return None
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        return isoformat()
+    return str(value)
+
+
+def _promo_auth_required(error=None):
+    return {
+        "status": "auth_required",
+        "display": "auth required",
+        "expires": None,
+        "proxy": None,
+        "peer_id": None,
+        "title": None,
+        "username": None,
+        "psa_type": None,
+        "psa_message": None,
+        "pending_suggestions": [],
+        "dismissed_suggestions": [],
+        "custom_pending_suggestion": None,
+        "chats": [],
+        "users": [],
+        "response_type": None,
+        "error": error or "Run --mtproto-login to create an authorized Telethon session for promo data",
+    }
+
+
+def _json_safe(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        return isoformat()
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return _json_safe(to_dict())
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    return str(value)
+
+
+def _safe_peer_id(value):
+    if value is None:
+        return None
+    try:
+        return utils.get_peer_id(value)
+    except Exception:
+        for attr in ("channel_id", "chat_id", "user_id", "id"):
+            raw_value = getattr(value, attr, None)
+            if raw_value is not None:
+                return raw_value
+    return None
+
+
+def _entity_summary(entity):
+    if entity is None:
+        return None
+
+    username = getattr(entity, "username", None)
+    title = getattr(entity, "title", None)
+    if not title:
+        name_parts = [
+            str(part).strip()
+            for part in (getattr(entity, "first_name", None), getattr(entity, "last_name", None))
+            if part
+        ]
+        title = " ".join(name_parts) or None
+
+    entity_id = getattr(entity, "id", None)
+    peer_id = _safe_peer_id(entity)
+    kind = entity.__class__.__name__
+    display = f"@{username}" if username else (title or (str(peer_id or entity_id) if (peer_id or entity_id) else kind))
+
+    return {
+        "id": entity_id,
+        "peer_id": peer_id,
+        "kind": kind,
+        "title": title,
+        "username": username,
+        "display": display,
+    }
+
+
+def _select_promo_entity(peer_id, chats, users):
+    entities = []
+    for item in (chats or []):
+        summary = _entity_summary(item)
+        if summary:
+            entities.append(summary)
+    for item in (users or []):
+        summary = _entity_summary(item)
+        if summary:
+            entities.append(summary)
+
+    if peer_id is not None:
+        for item in entities:
+            if item.get("peer_id") == peer_id:
+                return item, entities
+    return (entities[0] if entities else None), entities
+
+
+def _normalize_promo_data(response):
+    base = {
+        "status": "empty",
+        "display": "none",
+        "expires": None,
+        "proxy": None,
+        "peer_id": None,
+        "title": None,
+        "username": None,
+        "psa_type": None,
+        "psa_message": None,
+        "pending_suggestions": [],
+        "dismissed_suggestions": [],
+        "custom_pending_suggestion": None,
+        "chats": [],
+        "users": [],
+        "response_type": response.__class__.__name__ if response is not None else None,
+        "error": None,
+    }
+
+    if response is None:
+        base["status"] = "unsupported"
+        base["display"] = "unsupported"
+        base["error"] = "Telethon has no help.GetPromoDataRequest"
+        return base
+
+    base["expires"] = _datetime_to_json(getattr(response, "expires", None))
+
+    if types is not None and isinstance(response, getattr(types.help, "PromoDataEmpty", ())):
+        return base
+
+    if types is None or not isinstance(response, getattr(types.help, "PromoData", ())):
+        base["status"] = "error"
+        base["display"] = "unexpected response"
+        base["error"] = response.__class__.__name__
+        return base
+
+    peer_id = _safe_peer_id(getattr(response, "peer", None))
+    selected, entities = _select_promo_entity(peer_id, getattr(response, "chats", []), getattr(response, "users", []))
+    chat_peer_ids = {
+        item.get("peer_id")
+        for item in (_entity_summary(chat) for chat in getattr(response, "chats", []))
+        if item
+    }
+
+    base.update({
+        "status": "present",
+        "proxy": bool(getattr(response, "proxy", False)),
+        "peer_id": peer_id,
+        "psa_type": getattr(response, "psa_type", None),
+        "psa_message": getattr(response, "psa_message", None),
+        "pending_suggestions": _json_safe(list(getattr(response, "pending_suggestions", []) or [])),
+        "dismissed_suggestions": _json_safe(list(getattr(response, "dismissed_suggestions", []) or [])),
+        "custom_pending_suggestion": _json_safe(getattr(response, "custom_pending_suggestion", None)),
+        "chats": [item for item in entities if item.get("peer_id") in chat_peer_ids],
+        "users": [item for item in entities if item.get("peer_id") not in chat_peer_ids],
+    })
+
+    if selected:
+        base["title"] = selected.get("title")
+        base["username"] = selected.get("username")
+        base["display"] = selected.get("display") or "present"
+    elif base["psa_type"]:
+        base["display"] = base["psa_type"]
+    elif base["proxy"]:
+        base["display"] = "proxy promo"
+    else:
+        base["display"] = "present"
+
+    return base
+
+
+async def _fetch_promo_data(client, timeout):
+    try:
+        response = await _invoke_promo_data_request(client, timeout)
+        return _normalize_promo_data(response)
+    except BaseException as exc:
+        if _should_reraise_base_exception(exc):
+            raise
+        return {
+            "status": "error",
+            "display": "error",
+            "expires": None,
+            "proxy": None,
+            "peer_id": None,
+            "title": None,
+            "username": None,
+            "psa_type": None,
+            "psa_message": None,
+            "pending_suggestions": [],
+            "dismissed_suggestions": [],
+            "custom_pending_suggestion": None,
+            "chats": [],
+            "users": [],
+            "response_type": exc.__class__.__name__,
+            "error": _format_probe_error(exc),
+        }
+
+
+def _promo_session_path(runtime_cfg):
+    return str((runtime_cfg or {}).get("promo_session_file") or "mtproto_promo").strip() or "mtproto_promo"
+
+
+def _promo_session_exists(session_path):
+    if not session_path:
+        return False
+    candidates = [session_path]
+    root, ext = os.path.splitext(session_path)
+    if ext.lower() != ".session":
+        candidates.append(f"{session_path}.session")
+    return any(os.path.exists(candidate) for candidate in candidates)
+
+
+def _select_promo_connection(entry, transport_name=None):
+    candidates = _build_connection_candidates(entry or {})
+    if not candidates:
+        return None
+    if transport_name:
+        for name, connection_cls in candidates:
+            if name == transport_name:
+                return connection_cls
+    return candidates[0][1]
+
+
+def _build_promo_client(runtime_cfg, entry=None, connection_cls=None, session_string=None):
+    api_id = int((runtime_cfg or {}).get("api_id") or 0)
+    api_hash = str((runtime_cfg or {}).get("api_hash") or "").strip()
+    timeout = float((runtime_cfg or {}).get("promo_timeout") or (runtime_cfg or {}).get("timeout") or 5)
+    kwargs = {
+        "timeout": timeout,
+        "request_retries": 0,
+        "connection_retries": 0,
+        "retry_delay": 0,
+        "auto_reconnect": False,
+        "receive_updates": False,
+        "sequential_updates": False,
+        "device_model": "MK_XrayChecker",
+        "app_version": "MK_XrayChecker",
+        "system_version": "python",
+        "lang_code": "en",
+        "system_lang_code": "en",
+        "base_logger": _get_quiet_telethon_logger(),
+    }
+    if entry is not None:
+        kwargs["proxy"] = entry.get(
+            "telethon_proxy",
+            (entry["server"], entry["port"], entry.get("telethon_secret", entry.get("secret"))),
+        )
+    if connection_cls is not None:
+        kwargs["connection"] = connection_cls
+
+    session = StringSession(session_string) if session_string else _promo_session_path(runtime_cfg)
+    return TelegramClient(session, api_id, api_hash, **kwargs)
+
+
+def _load_promo_session_string(runtime_cfg):
+    if StringSession is None:
+        return None
+    client = _build_promo_client(runtime_cfg)
+    return StringSession.save(client.session)
+
+
+async def _fetch_promo_data_with_session(entry, runtime_cfg, transport_name=None, session_string=None):
+    session_path = _promo_session_path(runtime_cfg)
+    if not _promo_session_exists(session_path):
+        return _promo_auth_required(f"Authorized session not found: {session_path}.session")
+
+    connection_cls = _select_promo_connection(entry, transport_name)
+    if connection_cls is None:
+        return {
+            "status": "error",
+            "display": "error",
+            "expires": None,
+            "proxy": None,
+            "peer_id": None,
+            "title": None,
+            "username": None,
+            "psa_type": None,
+            "psa_message": None,
+            "pending_suggestions": [],
+            "dismissed_suggestions": [],
+            "custom_pending_suggestion": None,
+            "chats": [],
+            "users": [],
+            "response_type": None,
+            "error": "No compatible connection class for promo probe",
+        }
+
+    timeout = float((runtime_cfg or {}).get("promo_timeout") or (runtime_cfg or {}).get("timeout") or 5)
+    client = _build_promo_client(
+        runtime_cfg,
+        entry=entry,
+        connection_cls=connection_cls,
+        session_string=session_string,
+    )
+    try:
+        await asyncio.wait_for(client.connect(), timeout=timeout)
+        if not await asyncio.wait_for(client.is_user_authorized(), timeout=timeout):
+            return _promo_auth_required(f"Session is not authorized: {session_path}.session")
+        return await _fetch_promo_data(client, timeout)
+    except BaseException as exc:
+        if _should_reraise_base_exception(exc):
+            raise
+        return {
+            "status": "error",
+            "display": "error",
+            "expires": None,
+            "proxy": None,
+            "peer_id": None,
+            "title": None,
+            "username": None,
+            "psa_type": None,
+            "psa_message": None,
+            "pending_suggestions": [],
+            "dismissed_suggestions": [],
+            "custom_pending_suggestion": None,
+            "chats": [],
+            "users": [],
+            "response_type": exc.__class__.__name__,
+            "error": _format_probe_error(exc),
+        }
+    finally:
+        try:
+            await client.disconnect()
+            await asyncio.sleep(0)
+        except BaseException as exc:
+            if _should_reraise_base_exception(exc):
+                raise
+
+
+async def _enrich_promo_results_async(all_results, runtime_cfg):
+    if not bool((runtime_cfg or {}).get("fetch_promo_data", False)):
+        return all_results
+
+    session_path = _promo_session_path(runtime_cfg)
+    if not _promo_session_exists(session_path):
+        auth_required = _promo_auth_required(f"Authorized session not found: {session_path}.session")
+        for result in all_results or []:
+            if isinstance(result, dict) and result.get("status") in ("live", "drop"):
+                result["promo_data"] = dict(auth_required)
+        return all_results
+
+    session_string = _load_promo_session_string(runtime_cfg)
+    if not session_string:
+        auth_required = _promo_auth_required(f"Could not read authorized session: {session_path}.session")
+        for result in all_results or []:
+            if isinstance(result, dict) and result.get("status") in ("live", "drop"):
+                result["promo_data"] = dict(auth_required)
+        return all_results
+
+    candidates = [
+        result for result in (all_results or [])
+        if isinstance(result, dict)
+        and result.get("status") in ("live", "drop")
+        and isinstance(result.get("entry"), dict)
+    ]
+    candidates.sort(
+        key=lambda result: (
+            result.get("ping_ms") is None,
+            result.get("ping_ms") if result.get("ping_ms") is not None else 10**9,
+        )
+    )
+    promo_probe_limit = int(
+        (runtime_cfg or {}).get("promo_probe_limit")
+        or (runtime_cfg or {}).get("promo_limit")
+        or 0
+    )
+    if promo_probe_limit > 0:
+        candidates = candidates[:promo_probe_limit]
+
+    promo_threads = int(
+        (runtime_cfg or {}).get("promo_threads")
+        or (runtime_cfg or {}).get("promo_parallelism")
+        or 1
+    )
+    promo_threads = max(1, min(promo_threads, len(candidates) or 1))
+    semaphore = asyncio.Semaphore(promo_threads)
+
+    async def _enrich_one(result):
+        async with semaphore:
+            result["promo_data"] = await _fetch_promo_data_with_session(
+                result["entry"],
+                runtime_cfg,
+                transport_name=result.get("transport"),
+                session_string=session_string,
+            )
+
+    await asyncio.gather(*(_enrich_one(result) for result in candidates))
+
+    if promo_probe_limit > 0:
+        skipped = {
+            "status": "skipped",
+            "display": "skipped",
+            "expires": None,
+            "proxy": None,
+            "peer_id": None,
+            "title": None,
+            "username": None,
+            "psa_type": None,
+            "psa_message": None,
+            "pending_suggestions": [],
+            "dismissed_suggestions": [],
+            "custom_pending_suggestion": None,
+            "chats": [],
+            "users": [],
+            "response_type": None,
+            "error": f"Skipped by promo_probe_limit={promo_probe_limit}",
+        }
+        candidate_ids = {id(result) for result in candidates}
+        for result in all_results or []:
+            if (
+                isinstance(result, dict)
+                and result.get("status") in ("live", "drop")
+                and id(result) not in candidate_ids
+            ):
+                result["promo_data"] = dict(skipped)
+    return all_results
+
+
+def enrich_promo_results(all_results, runtime_cfg):
+    loop = asyncio.new_event_loop()
+
+    def _exception_handler(current_loop, context):
+        if _is_expected_mtproto_loop_noise(context):
+            return
+        current_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_exception_handler)
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(_enrich_promo_results_async(all_results, runtime_cfg))
+    finally:
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except BaseException as exc:
+            if _should_reraise_base_exception(exc):
+                raise
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
+async def _login_promo_session_async(
+    runtime_cfg,
+    proxy_entry=None,
+    phone=None,
+    code_callback=None,
+    password=None,
+):
+    connection_cls = _select_promo_connection(proxy_entry) if proxy_entry else None
+    client = _build_promo_client(runtime_cfg, entry=proxy_entry, connection_cls=connection_cls)
+    try:
+        await client.start(phone=phone, code_callback=code_callback, password=password)
+        me = await client.get_me()
+        return {
+            "session_file": _promo_session_path(runtime_cfg),
+            "user_id": getattr(me, "id", None),
+            "username": getattr(me, "username", None),
+            "phone": getattr(me, "phone", None),
+            "name": " ".join(
+                str(part).strip()
+                for part in (getattr(me, "first_name", None), getattr(me, "last_name", None))
+                if part
+            ) or None,
+        }
+    finally:
+        await client.disconnect()
+
+
+def login_promo_session(runtime_cfg, proxy_entry=None, phone=None, code_callback=None, password=None):
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(
+            _login_promo_session_async(
+                runtime_cfg,
+                proxy_entry=proxy_entry,
+                phone=phone,
+                code_callback=code_callback,
+                password=password,
+            )
+        )
+    finally:
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except BaseException as exc:
+            if _should_reraise_base_exception(exc):
+                raise
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
+def _safe_log_text(value, limit=80):
+    text = str(value or "").replace("\n", " ").replace("\r", " ").strip()
+    text = text.replace("[", "(").replace("]", ")")
+    if len(text) > limit:
+        return text[: max(0, limit - 3)] + "..."
+    return text
+
+
+def format_promo_display(promo_data):
+    if not isinstance(promo_data, dict):
+        return ""
+
+    status = promo_data.get("status")
+    if status == "present":
+        return _safe_log_text(promo_data.get("display") or "present", limit=40)
+    if status == "empty":
+        return "none"
+    if status == "unsupported":
+        return "unsupported"
+    if status == "auth_required":
+        return "auth required"
+    if status == "skipped":
+        return "skipped"
+    if status == "error":
+        error = _safe_log_text(promo_data.get("error") or "error", limit=44)
+        return f"error: {error}"
+    return _safe_log_text(status or "unknown", limit=40)
+
+
 async def _probe_mtproto_async(entry, runtime_cfg):
     api_id = int(runtime_cfg.get("api_id") or 0)
     api_hash = str(runtime_cfg.get("api_hash") or "").strip()
@@ -1167,7 +1704,7 @@ async def _probe_mtproto_async(entry, runtime_cfg):
                             auto_reconnect=False,
                             receive_updates=False,
                             sequential_updates=False,
-                            device_model="MK_XRAYchecker",
+                            device_model="MK_XrayChecker",
                             app_version="mtproto-checker",
                             system_version="python",
                             lang_code="en",
@@ -1219,6 +1756,7 @@ async def _probe_mtproto_async(entry, runtime_cfg):
                                         "transport": transport_name,
                                         "dc_id": dc_id,
                                         "probe_name": probe_name,
+                                        "promo_data": None,
                                         "attempts": attempts,
                                     }
                                 except BaseException as exc:
@@ -1499,10 +2037,59 @@ def write_attempt_diagnostics(path, all_results):
             "transport": result.get("transport"),
             "dc_id": result.get("dc_id"),
             "probe_name": result.get("probe_name"),
+            "promo_data": result.get("promo_data"),
             "proxy": entry.get("canonical_url") or entry.get("original_url"),
             "label": entry.get("label"),
             "secret_mode": entry.get("secret_mode"),
             "attempts": result.get("attempts") or [],
+        })
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def summarize_promo_results(all_results):
+    summary = {
+        "present": 0,
+        "empty": 0,
+        "error": 0,
+        "unsupported": 0,
+        "auth_required": 0,
+        "skipped": 0,
+        "unknown": 0,
+    }
+    for result in all_results or []:
+        if not isinstance(result, dict) or result.get("status") not in ("live", "drop"):
+            continue
+        promo_data = result.get("promo_data")
+        if not isinstance(promo_data, dict):
+            summary["unknown"] += 1
+            continue
+        status = str(promo_data.get("status") or "unknown")
+        if status not in summary:
+            status = "unknown"
+        summary[status] += 1
+    return summary
+
+
+def write_promo_diagnostics(path, all_results):
+    payload = []
+    for result in all_results or []:
+        if not isinstance(result, dict):
+            continue
+        promo_data = result.get("promo_data")
+        if promo_data is None:
+            continue
+        entry = result.get("entry", {}) if isinstance(result.get("entry"), dict) else {}
+        payload.append({
+            "status": result.get("status"),
+            "ping_ms": result.get("ping_ms"),
+            "transport": result.get("transport"),
+            "dc_id": result.get("dc_id"),
+            "probe_name": result.get("probe_name"),
+            "proxy": entry.get("canonical_url") or entry.get("original_url"),
+            "label": entry.get("label"),
+            "secret_mode": entry.get("secret_mode"),
+            "promo_data": promo_data,
         })
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
