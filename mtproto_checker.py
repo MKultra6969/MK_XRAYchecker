@@ -9,6 +9,7 @@ import asyncio
 import base64
 import binascii
 import html
+import json
 import logging
 import os
 import re
@@ -16,11 +17,18 @@ import socket
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 import requests
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 ALLOWED_CRYPTO_BACKENDS = {"auto", "safe", "unsafe"}
+ALLOWED_PROBE_POLICIES = {"strict", "balanced", "telegram_like"}
+PROBE_POLICY_DEFAULTS = {
+    "strict": {"connect_retries": 0, "rpc_retries": 0, "fallback_probes": ()},
+    "balanced": {"connect_retries": 1, "rpc_retries": 1, "fallback_probes": ("nearest_dc",)},
+    "telegram_like": {"connect_retries": 1, "rpc_retries": 2, "fallback_probes": ("nearest_dc",)},
+}
 
 try:
     from telethon import TelegramClient, connection, functions, utils
@@ -85,6 +93,21 @@ TELEGRAM_DC_OPTIONS = [
 _TELETHON_LIBSSL_ORIGINALS = None
 _TELETHON_AES_DECRYPT_ORIGINAL = None
 _TELETHON_AES_GUARD_INSTALLED = False
+_SUCCESSFUL_CONFIG_DC_CANDIDATES = []
+_SUCCESSFUL_CONFIG_DC_LOCK = Lock()
+
+
+class MTProtoSenderConnectError(ConnectionError):
+    def __init__(self, original, connection_instance=None):
+        super().__init__(str(original) or original.__class__.__name__)
+        self.original = original
+        self.transport_handshake_completed = bool(
+            getattr(connection_instance, "fake_tls_server_hello_verified", False)
+            or getattr(connection_instance, "mtproxy_initial_payload_sent", False)
+        )
+        self.faketls_application_data_seen = bool(
+            getattr(connection_instance, "fake_tls_application_data_seen", False)
+        )
 
 
 def _setup_telethon_logging():
@@ -681,6 +704,7 @@ def validate_runtime_config(runtime_cfg):
 
     api_hash = str(runtime_cfg.get("api_hash") or "").strip()
     crypto_backend = str(runtime_cfg.get("crypto_backend", "auto") or "auto").strip().lower()
+    probe_policy = _get_probe_policy(runtime_cfg)
     if api_id <= 0:
         return False, "MTProto api_id не задан в config.json"
     if not api_hash:
@@ -688,7 +712,44 @@ def validate_runtime_config(runtime_cfg):
     if crypto_backend not in ALLOWED_CRYPTO_BACKENDS:
         allowed = "/".join(sorted(ALLOWED_CRYPTO_BACKENDS))
         return False, f"MTProto crypto_backend должен быть одним из: {allowed}"
+    if probe_policy not in ALLOWED_PROBE_POLICIES:
+        allowed = "/".join(sorted(ALLOWED_PROBE_POLICIES))
+        return False, f"MTProto probe_policy должен быть одним из: {allowed}"
     return True, None
+
+
+def _coerce_nonnegative_int(value, default=0, maximum=3):
+    try:
+        coerced = int(value)
+    except Exception:
+        coerced = int(default)
+    if coerced < 0:
+        return 0
+    if maximum is not None:
+        return min(coerced, int(maximum))
+    return coerced
+
+
+def _get_probe_policy(runtime_cfg):
+    policy = str((runtime_cfg or {}).get("probe_policy", "balanced") or "balanced").strip().lower()
+    return policy if policy in ALLOWED_PROBE_POLICIES else policy
+
+
+def _get_probe_retry_budget(runtime_cfg, key):
+    policy = _get_probe_policy(runtime_cfg)
+    defaults = PROBE_POLICY_DEFAULTS.get(policy, PROBE_POLICY_DEFAULTS["balanced"])
+    default = defaults.get(key, 0)
+    return _coerce_nonnegative_int((runtime_cfg or {}).get(key, default), default=default, maximum=3)
+
+
+def _get_probe_ladder(runtime_cfg):
+    policy = _get_probe_policy(runtime_cfg)
+    defaults = PROBE_POLICY_DEFAULTS.get(policy, PROBE_POLICY_DEFAULTS["balanced"])
+    probes = ["get_config"]
+    for probe_name in defaults.get("fallback_probes", ()):
+        if probe_name not in probes:
+            probes.append(probe_name)
+    return probes
 
 
 def rank_telegram_dcs(timeout=1.5, limit=DEFAULT_DC_PROBE_LIMIT):
@@ -733,15 +794,58 @@ def _normalize_dc_candidates(candidates):
     return normalized
 
 
+def _get_successful_config_dc_candidates():
+    with _SUCCESSFUL_CONFIG_DC_LOCK:
+        return [dict(item) for item in _SUCCESSFUL_CONFIG_DC_CANDIDATES]
+
+
+def _extract_config_dc_candidates(config_response):
+    candidates = []
+    for dc in getattr(config_response, "dc_options", []) or []:
+        try:
+            dc_id = int(getattr(dc, "id", 0) or 0)
+            host = str(getattr(dc, "ip_address", "") or "").strip()
+            port = int(getattr(dc, "port", 443) or 443)
+        except Exception:
+            continue
+        if dc_id <= 0 or not host or ":" in host:
+            continue
+        candidates.append({"dc_id": dc_id, "host": host, "port": port})
+    return _normalize_dc_candidates(candidates)
+
+
+def _remember_successful_config_dcs(config_response):
+    candidates = _extract_config_dc_candidates(config_response)
+    if not candidates:
+        return
+    with _SUCCESSFUL_CONFIG_DC_LOCK:
+        existing = _normalize_dc_candidates(_SUCCESSFUL_CONFIG_DC_CANDIDATES)
+        seen = {item.get("dc_id") for item in candidates}
+        merged = list(candidates)
+        for item in existing:
+            if item.get("dc_id") in seen:
+                continue
+            merged.append(item)
+        _SUCCESSFUL_CONFIG_DC_CANDIDATES[:] = merged
+
+
 def _build_dc_attempt_batches(runtime_cfg):
-    preferred = _normalize_dc_candidates(
+    cached_config = _get_successful_config_dc_candidates()
+    configured_preferred = _normalize_dc_candidates(
         (runtime_cfg or {}).get("dc_candidates")
         or TELEGRAM_DC_OPTIONS[:DEFAULT_DC_PROBE_LIMIT]
     )
-    all_candidates = _normalize_dc_candidates(
+    preferred = _normalize_dc_candidates(cached_config + configured_preferred)
+    configured_all = (
         (runtime_cfg or {}).get("all_dc_candidates")
         or TELEGRAM_DC_OPTIONS
     )
+    all_candidates = _normalize_dc_candidates(
+        list(cached_config) + list(configured_all or [])
+    )
+
+    if not all_candidates:
+        all_candidates = _normalize_dc_candidates(configured_all)
 
     if not preferred:
         preferred = list(all_candidates)
@@ -771,6 +875,68 @@ def _format_probe_error(exc):
     if not message:
         return exc.__class__.__name__
     return f"{exc.__class__.__name__}: {message}"
+
+
+def _exception_class_names(exc):
+    return {cls.__name__ for cls in exc.__class__.mro()}
+
+
+def _classify_probe_error(exc, after_sender_connect=False):
+    class_names = _exception_class_names(exc)
+    text = str(exc)
+
+    soft_names = {
+        "TimeoutError",
+        "IncompleteReadError",
+        "ConnectionError",
+        "ConnectionResetError",
+        "InvalidDCError",
+        "AuthKeyNotFound",
+        "AuthKeyError",
+        "ServerError",
+        "RpcCallFailError",
+        "TimedOutError",
+    }
+    is_misaligned_mtproto = isinstance(exc, ValueError) and text.startswith(
+        "MTProto ciphertext length must be divisible by 16"
+    )
+    is_soft = (
+        bool(class_names & soft_names)
+        or isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError, asyncio.IncompleteReadError))
+        or is_misaligned_mtproto
+    )
+
+    if after_sender_connect:
+        return "connect_only"
+    return "soft_fail" if is_soft else "fail"
+
+
+def _record_probe_attempt(
+    attempts,
+    dc_candidate,
+    transport_name,
+    entry,
+    phase,
+    status,
+    *,
+    probe_name=None,
+    retry_index=0,
+    elapsed_ms=None,
+    error=None,
+):
+    attempts.append({
+        "dc_id": dc_candidate.get("dc_id") if isinstance(dc_candidate, dict) else None,
+        "dc_host": dc_candidate.get("host") if isinstance(dc_candidate, dict) else None,
+        "dc_port": dc_candidate.get("port") if isinstance(dc_candidate, dict) else None,
+        "transport": transport_name,
+        "secret_mode": entry.get("secret_mode") if isinstance(entry, dict) else None,
+        "probe_name": probe_name,
+        "retry_index": retry_index,
+        "phase": phase,
+        "elapsed_ms": elapsed_ms,
+        "status": status,
+        "error": error,
+    })
 
 
 def _should_reraise_base_exception(exc):
@@ -913,16 +1079,24 @@ async def _connect_sender_only(client, timeout, dc_candidate=None):
         proxy=client._proxy,
         local_addr=client._local_addr,
     )
-    await asyncio.wait_for(client._sender.connect(connection_instance), timeout=timeout)
+    try:
+        await asyncio.wait_for(client._sender.connect(connection_instance), timeout=timeout)
+    except BaseException as exc:
+        if _should_reraise_base_exception(exc):
+            raise
+        raise MTProtoSenderConnectError(exc, connection_instance=connection_instance) from exc
     client.session.auth_key = client._sender.auth_key
     await utils.maybe_async(client.session.save())
 
 
-async def _invoke_probe_request(client, timeout):
+async def _invoke_probe_request(client, timeout, probe_name="get_config"):
     client.session.auth_key = client._sender.auth_key
     await utils.maybe_async(client.session.save())
 
-    client._init_request.query = functions.help.GetConfigRequest()
+    if probe_name == "nearest_dc":
+        client._init_request.query = functions.help.GetNearestDcRequest()
+    else:
+        client._init_request.query = functions.help.GetConfigRequest()
     request = client._init_request
     if client._no_updates:
         request = functions.InvokeWithoutUpdatesRequest(request)
@@ -938,7 +1112,11 @@ async def _probe_mtproto_async(entry, runtime_cfg):
     api_hash = str(runtime_cfg.get("api_hash") or "").strip()
     timeout = float(runtime_cfg.get("timeout") or 5)
     connect_timeout = _get_probe_connect_timeout(entry, runtime_cfg)
+    connect_retries = _get_probe_retry_budget(runtime_cfg, "connect_retries")
+    rpc_retries = _get_probe_retry_budget(runtime_cfg, "rpc_retries")
+    probe_ladder = _get_probe_ladder(runtime_cfg)
     proxy_reachability_timeout = min(max(timeout, 1.0), 5.0)
+    attempts = []
 
     candidates = _build_connection_candidates(entry)
     if not candidates:
@@ -950,6 +1128,7 @@ async def _probe_mtproto_async(entry, runtime_cfg):
                 "FakeTLS backend unavailable"
                 + (f": {FAKETLS_IMPORT_ERROR}" if FAKETLS_IMPORT_ERROR else "")
             ),
+            "attempts": attempts,
         }
 
     proxy_error = await _probe_proxy_reachability(entry, proxy_reachability_timeout)
@@ -959,100 +1138,226 @@ async def _probe_mtproto_async(entry, runtime_cfg):
             "ping_ms": None,
             "status": "proxy_unreachable",
             "error": proxy_error,
+            "attempts": attempts,
         }
 
     dc_attempt_batches = _build_dc_attempt_batches(runtime_cfg)
     best_connect_only = None
+    best_soft_fail = None
     last_error = "Unknown error"
     for dc_candidates in dc_attempt_batches:
         for dc_candidate in dc_candidates:
             dc_id = dc_candidate.get("dc_id")
             for transport_name, connection_cls in candidates:
-                client = None
-                start_time = time.perf_counter()
-                try:
-                    client = TelegramClient(
-                        None,
-                        api_id,
-                        api_hash,
-                        connection=connection_cls,
-                        proxy=entry.get("telethon_proxy", (entry["server"], entry["port"], entry.get("telethon_secret", entry.get("secret")))),
-                        timeout=connect_timeout,
-                        request_retries=0,
-                        connection_retries=0,
-                        retry_delay=0,
-                        auto_reconnect=False,
-                        receive_updates=False,
-                        sequential_updates=False,
-                        device_model="MK_XRAYchecker",
-                        app_version="mtproto-checker",
-                        system_version="python",
-                        lang_code="en",
-                        system_lang_code="en",
-                        base_logger=_get_quiet_telethon_logger(),
-                    )
-                    await _connect_sender_only(client, connect_timeout, dc_candidate=dc_candidate)
-                    connect_ping_ms = round((time.perf_counter() - start_time) * 1000)
-                    if not client.is_connected():
-                        last_error = f"dc{dc_id}/{transport_name}: Disconnected after connect"
-                        continue
-
+                for connect_retry in range(connect_retries + 1):
+                    client = None
+                    start_time = time.perf_counter()
+                    connect_ping_ms = None
                     try:
-                        await _invoke_probe_request(client, timeout)
-                        return {
+                        client = TelegramClient(
+                            None,
+                            api_id,
+                            api_hash,
+                            connection=connection_cls,
+                            proxy=entry.get("telethon_proxy", (entry["server"], entry["port"], entry.get("telethon_secret", entry.get("secret")))),
+                            timeout=connect_timeout,
+                            request_retries=0,
+                            connection_retries=0,
+                            retry_delay=0,
+                            auto_reconnect=False,
+                            receive_updates=False,
+                            sequential_updates=False,
+                            device_model="MK_XRAYchecker",
+                            app_version="mtproto-checker",
+                            system_version="python",
+                            lang_code="en",
+                            system_lang_code="en",
+                            base_logger=_get_quiet_telethon_logger(),
+                        )
+                        await _connect_sender_only(client, connect_timeout, dc_candidate=dc_candidate)
+                        connect_ping_ms = round((time.perf_counter() - start_time) * 1000)
+                        if not client.is_connected():
+                            last_error = f"dc{dc_id}/{transport_name}: Disconnected after connect"
+                            _record_probe_attempt(
+                                attempts,
+                                dc_candidate,
+                                transport_name,
+                                entry,
+                                "connect",
+                                "soft_fail",
+                                retry_index=connect_retry,
+                                elapsed_ms=connect_ping_ms,
+                                error="Disconnected after connect",
+                            )
+                            continue
+
+                        for rpc_retry in range(rpc_retries + 1):
+                            for probe_name in probe_ladder:
+                                probe_start = time.perf_counter()
+                                try:
+                                    response = await _invoke_probe_request(client, timeout, probe_name=probe_name)
+                                    elapsed_ms = round((time.perf_counter() - start_time) * 1000)
+                                    _record_probe_attempt(
+                                        attempts,
+                                        dc_candidate,
+                                        transport_name,
+                                        entry,
+                                        "rpc",
+                                        "live",
+                                        probe_name=probe_name,
+                                        retry_index=rpc_retry,
+                                        elapsed_ms=round((time.perf_counter() - probe_start) * 1000),
+                                        error=None,
+                                    )
+                                    if probe_name == "get_config":
+                                        _remember_successful_config_dcs(response)
+                                    return {
+                                        "entry": entry,
+                                        "ping_ms": elapsed_ms,
+                                        "status": "live",
+                                        "error": None,
+                                        "transport": transport_name,
+                                        "dc_id": dc_id,
+                                        "probe_name": probe_name,
+                                        "attempts": attempts,
+                                    }
+                                except BaseException as exc:
+                                    if _should_reraise_base_exception(exc):
+                                        raise
+                                    formatted_error = _format_probe_error(exc)
+                                    status = _classify_probe_error(exc, after_sender_connect=True)
+                                    _record_probe_attempt(
+                                        attempts,
+                                        dc_candidate,
+                                        transport_name,
+                                        entry,
+                                        "rpc",
+                                        status,
+                                        probe_name=probe_name,
+                                        retry_index=rpc_retry,
+                                        elapsed_ms=round((time.perf_counter() - probe_start) * 1000),
+                                        error=formatted_error,
+                                    )
+                                    best_connect_only = {
+                                        "entry": entry,
+                                        "ping_ms": connect_ping_ms,
+                                        "status": "connect_only",
+                                        "error": formatted_error,
+                                        "transport": transport_name,
+                                        "dc_id": dc_id,
+                                        "probe_name": probe_name,
+                                        "attempts": attempts,
+                                    }
+                                    last_error = f"dc{dc_id}/{transport_name}/{probe_name}: {formatted_error}"
+                    except asyncio.TimeoutError as exc:
+                        formatted_error = "Timeout"
+                        last_error = f"dc{dc_id}/{transport_name}: {formatted_error}"
+                        _record_probe_attempt(
+                            attempts,
+                            dc_candidate,
+                            transport_name,
+                            entry,
+                            "connect",
+                            "soft_fail",
+                            retry_index=connect_retry,
+                            elapsed_ms=round((time.perf_counter() - start_time) * 1000),
+                            error=formatted_error,
+                        )
+                        best_soft_fail = {
                             "entry": entry,
-                            "ping_ms": connect_ping_ms,
-                            "status": "live",
-                            "error": None,
+                            "ping_ms": None,
+                            "status": "soft_fail",
+                            "error": last_error,
                             "transport": transport_name,
                             "dc_id": dc_id,
+                            "attempts": attempts,
                         }
                     except BaseException as exc:
                         if _should_reraise_base_exception(exc):
                             raise
-                        best_connect_only = {
-                            "entry": entry,
-                            "ping_ms": connect_ping_ms,
-                            "status": "connect_only",
-                            "error": _format_probe_error(exc),
-                            "transport": transport_name,
-                            "dc_id": dc_id,
-                        }
-                        last_error = f"dc{dc_id}/{transport_name}: {best_connect_only['error']}"
-                except asyncio.TimeoutError:
-                    last_error = f"dc{dc_id}/{transport_name}: Timeout"
-                except BaseException as exc:
-                    if _should_reraise_base_exception(exc):
-                        raise
-                    last_error = f"dc{dc_id}/{transport_name}: {_format_probe_error(exc)}"
-                finally:
-                    if client is not None:
-                        try:
-                            await client.disconnect()
-                            await asyncio.sleep(0)
-                        except BaseException as exc:
-                            if _should_reraise_base_exception(exc):
-                                raise
-                            disconnect_error = _format_probe_error(exc)
-                            if best_connect_only is None:
-                                best_connect_only = {
-                                    "entry": entry,
-                                    "ping_ms": None,
-                                    "status": "fail",
-                                    "error": f"disconnect failed: {disconnect_error}",
-                                    "transport": transport_name,
-                                    "dc_id": dc_id,
-                                }
-                            last_error = f"dc{dc_id}/{transport_name}: disconnect failed: {disconnect_error}"
+                        formatted_error = _format_probe_error(exc)
+                        handshake_completed = bool(getattr(exc, "transport_handshake_completed", False))
+                        status = (
+                            "connect_only"
+                            if handshake_completed
+                            else _classify_probe_error(exc, after_sender_connect=False)
+                        )
+                        last_error = f"dc{dc_id}/{transport_name}: {formatted_error}"
+                        _record_probe_attempt(
+                            attempts,
+                            dc_candidate,
+                            transport_name,
+                            entry,
+                            "connect",
+                            status,
+                            retry_index=connect_retry,
+                            elapsed_ms=round((time.perf_counter() - start_time) * 1000),
+                            error=formatted_error,
+                        )
+                        if status == "connect_only":
+                            best_connect_only = {
+                                "entry": entry,
+                                "ping_ms": round((time.perf_counter() - start_time) * 1000),
+                                "status": "connect_only",
+                                "error": formatted_error,
+                                "transport": transport_name,
+                                "dc_id": dc_id,
+                                "probe_name": "transport_handshake",
+                                "attempts": attempts,
+                            }
+                        elif status == "soft_fail":
+                            best_soft_fail = {
+                                "entry": entry,
+                                "ping_ms": None,
+                                "status": "soft_fail",
+                                "error": last_error,
+                                "transport": transport_name,
+                                "dc_id": dc_id,
+                                "attempts": attempts,
+                            }
+                    finally:
+                        if client is not None:
+                            try:
+                                await client.disconnect()
+                                await asyncio.sleep(0)
+                            except BaseException as exc:
+                                if _should_reraise_base_exception(exc):
+                                    raise
+                                disconnect_error = _format_probe_error(exc)
+                                _record_probe_attempt(
+                                    attempts,
+                                    dc_candidate,
+                                    transport_name,
+                                    entry,
+                                    "disconnect",
+                                    "fail",
+                                    retry_index=connect_retry,
+                                    elapsed_ms=None,
+                                    error=disconnect_error,
+                                )
+                                if best_connect_only is None:
+                                    best_soft_fail = {
+                                        "entry": entry,
+                                        "ping_ms": None,
+                                        "status": "soft_fail",
+                                        "error": f"disconnect failed: {disconnect_error}",
+                                        "transport": transport_name,
+                                        "dc_id": dc_id,
+                                        "attempts": attempts,
+                                    }
+                                last_error = f"dc{dc_id}/{transport_name}: disconnect failed: {disconnect_error}"
 
     if best_connect_only is not None:
         return best_connect_only
+    if best_soft_fail is not None:
+        return best_soft_fail
 
     return {
         "entry": entry,
         "ping_ms": None,
         "status": "fail",
         "error": last_error,
+        "attempts": attempts,
     }
 
 
@@ -1134,6 +1439,12 @@ def run_mtproto_check(entries, runtime_cfg, log_func=None, progress_callback=Non
                             f"[cyan][CONN][/] [white]{label:<25}[/] | "
                             f"{ping_ms:>4}ms | {error_reason or 'RPC failed'} | {proxy_kind}"
                         )
+                elif result.get("status") != "live":
+                    if log_func:
+                        log_func(
+                            f"[magenta][SOFT][/] [white]{label:<25}[/] | "
+                            f"{ping_ms:>4}ms | {error_reason or 'Soft probe failure'} | {proxy_kind}"
+                        )
                 elif max_ping_ms and ping_ms > max_ping_ms:
                     result["status"] = "drop"
                     if log_func:
@@ -1143,10 +1454,11 @@ def run_mtproto_check(entries, runtime_cfg, log_func=None, progress_callback=Non
                         )
                 else:
                     result["status"] = "live"
+                    probe_suffix = f" | {result.get('probe_name')}" if result.get("probe_name") else ""
                     if log_func:
                         log_func(
                             f"[green][LIVE][/] [white]{label:<25}[/] | "
-                            f"{ping_ms:>4}ms | {proxy_kind}"
+                            f"{ping_ms:>4}ms | {proxy_kind}{probe_suffix}"
                         )
                     current_live_results.append((entry.get("canonical_url", entry["original_url"]), ping_ms, 0.0))
             else:
@@ -1155,6 +1467,12 @@ def run_mtproto_check(entries, runtime_cfg, log_func=None, progress_callback=Non
                         log_func(
                             f"[yellow][UNREACH][/] [white]{label:<25}[/] | "
                             f"{error_reason or 'Proxy unreachable'} | {proxy_kind}"
+                        )
+                elif result.get("status") == "soft_fail":
+                    if log_func:
+                        log_func(
+                            f"[magenta][SOFT][/] [white]{label:<25}[/] | "
+                            f"{error_reason or 'Soft probe failure'} | {proxy_kind}"
                         )
                 else:
                     result["status"] = "fail"
@@ -1168,6 +1486,26 @@ def run_mtproto_check(entries, runtime_cfg, log_func=None, progress_callback=Non
                 progress_callback()
 
     return current_live_results, all_results
+
+
+def write_attempt_diagnostics(path, all_results):
+    payload = []
+    for result in all_results or []:
+        entry = result.get("entry", {}) if isinstance(result, dict) else {}
+        payload.append({
+            "status": result.get("status"),
+            "ping_ms": result.get("ping_ms"),
+            "error": result.get("error"),
+            "transport": result.get("transport"),
+            "dc_id": result.get("dc_id"),
+            "probe_name": result.get("probe_name"),
+            "proxy": entry.get("canonical_url") or entry.get("original_url"),
+            "label": entry.get("label"),
+            "secret_mode": entry.get("secret_mode"),
+            "attempts": result.get("attempts") or [],
+        })
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
 def run_parser_self_test(log_func=print):

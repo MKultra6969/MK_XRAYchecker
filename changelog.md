@@ -2,6 +2,19 @@
 
 Почти все изменения проекта будут документироваться в этом файле.
 
+## [1.5.0] - 2026-05-20
+
+### Added
+- MTProto checker получил `probe_policy` (`strict` / `balanced` / `telegram_like`), ограниченные `connect_retries`/`rpc_retries`, fallback RPC `help.GetNearestDcRequest` после `help.GetConfigRequest` и JSON-диагностику attempts через `debug_attempts`.
+- `CONN`/connect-only MTProto результаты теперь могут сохраняться отдельно в sidecar `sortedMtproto.conn.txt`, не смешиваясь с основным `LIVE` output.
+
+### Fixed
+- Исправлен FakeTLS `ee` stream handoff: server-handshake `application_data` больше не отдаётся Telethon как MTProto payload, а первый client application-data теперь предваряется TLS `ChangeCipherSpec`, как в TDLib/gotd.
+- Обновлён FakeTLS ClientHello под текущий TDLib-style layout с GREASE/permuted extensions, чтобы современные `ee` proxy не падали в ложный `CONN/SOFT`.
+
+### Changed
+- Документация MTProto синхронизирована с `MTPROTO_CHECKER_IMPROVEMENT_PLAN.md`: описаны статусы `LIVE / CONN / DROP / UNREACH / SOFT / FAIL`, политики `probe_policy` (`strict`, `balanced`, `telegram_like`), `connect_retries`/`rpc_retries`, `save_connect_only` и sidecar-файл `sortedMtproto.conn.txt`.
+
 ## [1.4.1] - 04-15-2026
 
 ### Added

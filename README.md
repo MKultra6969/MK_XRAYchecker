@@ -8,7 +8,7 @@
 
 <p>
   <a href="https://github.com/MKultra6969/MK_XRAYchecker">
-    <img src="https://img.shields.io/badge/VERSION-1.4.1-magenta?style=for-the-badge&logo=python" alt="Version">
+    <img src="https://img.shields.io/badge/VERSION-1.5.0-magenta?style=for-the-badge&logo=python" alt="Version">
   </a>
   <a href="http://www.wtfpl.net/">
     <img src="https://img.shields.io/badge/LICENSE-WTFPL-red?style=for-the-badge" alt="License">
@@ -167,7 +167,11 @@ python v2rayChecker.py --no-update
   - `max_ping_ms`: отдельный ping-порог для MTProto.
   - `dc_probe_limit`: сколько лучших Telegram DC пробовать для одного MTProto proxy.
   - `crypto_backend`: режим crypto backend для MTProto: `auto` / `safe` / `unsafe`.
-  - `output_file`: отдельный output-файл, например `sortedMtproto.txt`.
+  - `probe_policy`: политика проверки MTProto: `strict`, `balanced` или `telegram_like`.
+  - `connect_retries`: число повторов для MTProto connect при временных сетевых сбоях.
+  - `rpc_retries`: число повторов Telegram RPC probe после успешного connect.
+  - `save_connect_only`: сохранять `CONN` в отдельный sidecar-файл `sortedMtproto.conn.txt`.
+  - `output_file`: основной output-файл для `LIVE`, например `sortedMtproto.txt`.
 
 > ⚠️ `api_id` и `api_hash` лежат в `config.json` в открытом виде.
 
@@ -207,15 +211,25 @@ MTProto checker работает отдельно от Xray/Mihomo:
 - для `standard/dd` перебирает несколько MTProto transport-режимов, а для `ee` использует отдельный FakeTLS backend;
 - сортирует результаты только по ping;
 - не делает speed-test;
-- показывает отдельные статусы `LIVE / CONN / DROP / UNREACH / FAIL`;
-- пишет результат в отдельный файл (`sortedMtproto.txt` по умолчанию).
+- показывает отдельные статусы `LIVE / CONN / DROP / UNREACH / SOFT / FAIL`;
+- пишет `LIVE` в основной файл (`sortedMtproto.txt` по умолчанию), а `CONN` при `save_connect_only=true` складывает в sidecar `sortedMtproto.conn.txt`.
 
 Грубая интерпретация статусов:
 - `LIVE`: proxy прошёл MTProto connect и Telegram RPC probe.
-- `CONN`: proxy принял MTProto connect, но не довёл до успешного Telegram RPC.
+- `CONN`: transport/connect сработал, но Telegram RPC probe не завершился; это отдельный connect-only результат, а не `FAIL`.
 - `DROP`: proxy живой, но отфильтрован по `max_ping_ms`.
 - `UNREACH`: до proxy не удалось поднять даже сырой TCP connect с текущей машины.
+- `SOFT`: proxy TCP-доступен, но MTProto connect/handshake сорвался на ошибке, которую checker не считает окончательным доказательством смерти proxy.
 - `FAIL`: proxy не прошёл connect / handshake / probe.
+
+`probe_policy` управляет тем, насколько агрессивно checker делает connect/RPC retries и fallback-проверки:
+- `strict`: самый консервативный режим, ближе всего к текущей строгой логике.
+- `balanced`: умеренные retries и ограниченные fallback-проверки без лишнего шума.
+- `telegram_like`: поведение ближе к Telegram-клиентам, с более терпимыми retry/route сценариями.
+
+`connect_retries` и `rpc_retries` задают маленькие bounded retry-бюджеты, чтобы длинные списки не раздували runtime.
+
+Для современных `ee/FakeTLS` proxy checker использует TDLib-style ClientHello и TLS-record handoff: fake TLS handshake bytes не смешиваются с MTProto payload.
 
 Для проверки именно живых MTProto proxy, а не только быстрых, ставь `MTProto ping = 0` или `--max-ping 0`. Если укажешь `--speed` или `--sort speed` вместе с `--mtproto`, режим будет принудительно возвращён к ping-сортировке с предупреждением.
 
@@ -231,9 +245,18 @@ MTProto checker работает отдельно от Xray/Mihomo:
   "max_ping_ms": 1500,
   "dc_probe_limit": 3,
   "crypto_backend": "auto",
+  "probe_policy": "balanced",
+  "connect_retries": 1,
+  "rpc_retries": 1,
+  "save_connect_only": true,
+  "connect_only_output_file": "sortedMtproto.conn.txt",
+  "debug_attempts": false,
+  "attempts_output_file": "sortedMtproto.attempts.json",
   "output_file": "sortedMtproto.txt"
 }
 ```
+
+Если `save_connect_only=true`, sidecar `sortedMtproto.conn.txt` хранит `CONN`-результаты отдельно от основного `sortedMtproto.txt`.
 
 ---
 

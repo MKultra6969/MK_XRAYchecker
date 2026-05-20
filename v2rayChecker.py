@@ -19,7 +19,7 @@
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
 # +═════════════════════════════════════════════════════════════════════════+
-# ║                           VERSION 1.4.1                                 ║
+# ║                           VERSION 1.5.0                                 ║
 # ║             В случае багов/недочётов создайте issue на github           ║
 # ║                                                                         ║
 # +═════════════════════════════════════════════════════════════════════════+
@@ -61,7 +61,7 @@ YAML_WARNED = False
 
 # ВЕРСИЯ СКРИПТА
 # Формат: MAJOR.MINOR.PATCH (SemVer)
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 
 def _ensure_utf8_stdio():
@@ -336,6 +336,13 @@ DEFAULT_CONFIG = {
         "max_ping_ms": 666,
         "dc_probe_limit": 3,
         "crypto_backend": "auto",
+        "probe_policy": "balanced",
+        "connect_retries": 1,
+        "rpc_retries": 1,
+        "save_connect_only": True,
+        "connect_only_output_file": "sortedMtproto.conn.txt",
+        "debug_attempts": False,
+        "attempts_output_file": "sortedMtproto.attempts.json",
         "output_file": "sortedMtproto.txt"
     }
 }
@@ -2583,17 +2590,38 @@ def apply_mtproto_arg_defaults(args):
     return args
 
 
+def _derive_mtproto_sidecar_path(output_file, suffix=".conn.txt"):
+    output_file = str(output_file or "sortedMtproto.txt")
+    root, ext = os.path.splitext(output_file)
+    if ext:
+        return f"{root}{suffix}"
+    return f"{output_file}{suffix}"
+
+
 def build_mtproto_runtime_cfg(args):
     runtime_cfg = get_mtproto_config(GLOBAL_CFG)
     runtime_cfg["threads"] = max(1, int(getattr(args, "threads", runtime_cfg.get("threads", 20)) or 1))
     runtime_cfg["timeout"] = max(1, int(getattr(args, "timeout", runtime_cfg.get("timeout", 5)) or 1))
     runtime_cfg["max_ping_ms"] = max(0, int(getattr(args, "max_ping", runtime_cfg.get("max_ping_ms", 0)) or 0))
     runtime_cfg["dc_probe_limit"] = max(1, int(runtime_cfg.get("dc_probe_limit", 3) or 3))
+    runtime_cfg["probe_policy"] = str(runtime_cfg.get("probe_policy", "balanced") or "balanced").strip().lower()
+    runtime_cfg["connect_retries"] = max(0, min(3, int(runtime_cfg.get("connect_retries", 1) or 0)))
+    runtime_cfg["rpc_retries"] = max(0, min(3, int(runtime_cfg.get("rpc_retries", 1) or 0)))
+    runtime_cfg["save_connect_only"] = _bool_value(runtime_cfg.get("save_connect_only", True), True)
+    runtime_cfg["debug_attempts"] = _bool_value(runtime_cfg.get("debug_attempts", False), False)
     runtime_cfg["crypto_backend"] = str(
         getattr(args, "mtproto_crypto", runtime_cfg.get("crypto_backend", "auto"))
         or runtime_cfg.get("crypto_backend", "auto")
     ).strip().lower()
     runtime_cfg["output_file"] = str(getattr(args, "output", runtime_cfg.get("output_file", "sortedMtproto.txt")) or runtime_cfg.get("output_file", "sortedMtproto.txt"))
+    runtime_cfg["connect_only_output_file"] = str(
+        runtime_cfg.get("connect_only_output_file")
+        or _derive_mtproto_sidecar_path(runtime_cfg["output_file"])
+    )
+    runtime_cfg["attempts_output_file"] = str(
+        runtime_cfg.get("attempts_output_file")
+        or _derive_mtproto_sidecar_path(runtime_cfg["output_file"], ".attempts.json")
+    )
     return runtime_cfg
 
 
@@ -2751,9 +2779,51 @@ def run_mtproto_logic(args):
 
     results.sort(key=lambda x: x[1])
 
-    with open(runtime_cfg["output_file"], 'w', encoding='utf-8') as f:
-        for item in results:
-            f.write(item[0] + '\n')
+    connect_only_results = [
+        item for item in all_results
+        if item.get("status") == "connect_only" and item.get("entry")
+    ]
+    live_count = len([item for item in all_results if item.get("status") == "live"])
+    connect_only_count = len(connect_only_results)
+    drop_count = len([item for item in all_results if item.get("status") == "drop"])
+    unreachable_count = len([item for item in all_results if item.get("status") == "proxy_unreachable"])
+    soft_fail_count = len([item for item in all_results if item.get("status") == "soft_fail"])
+    failed_count = len([item for item in all_results if item.get("status") == "fail"])
+
+    preserve_empty_main = (
+        not results
+        and os.path.exists(runtime_cfg["output_file"])
+        and (connect_only_count > 0 or soft_fail_count > 0)
+    )
+    if preserve_empty_main:
+        safe_print(
+            f"[yellow]MTProto: 0 LIVE, основной файл не обнулён: {runtime_cfg['output_file']}[/]"
+        )
+    else:
+        with open(runtime_cfg["output_file"], 'w', encoding='utf-8') as f:
+            for item in results:
+                f.write(item[0] + '\n')
+
+    if runtime_cfg.get("save_connect_only", True):
+        preserve_empty_conn = (
+            not connect_only_results
+            and os.path.exists(runtime_cfg["connect_only_output_file"])
+            and soft_fail_count > 0
+        )
+        if preserve_empty_conn:
+            safe_print(
+                f"[yellow]MTProto: 0 CONN, sidecar не обнулён: {runtime_cfg['connect_only_output_file']}[/]"
+            )
+        else:
+            with open(runtime_cfg["connect_only_output_file"], 'w', encoding='utf-8') as f:
+                for item in connect_only_results:
+                    entry = item["entry"]
+                    f.write((entry.get("canonical_url") or entry.get("original_url")) + '\n')
+
+    auto_debug_attempts = live_count == 0 and (connect_only_count > 0 or soft_fail_count > 0)
+    if runtime_cfg.get("debug_attempts", False) or auto_debug_attempts:
+        mtproto_checker.write_attempt_diagnostics(runtime_cfg["attempts_output_file"], all_results)
+        safe_print(f"[dim]MTProto attempt diagnostics: {runtime_cfg['attempts_output_file']}[/]")
 
     if results:
         table = Table(title=f"Telegram proxy Results (Топ 15 из {len(results)})", box=box.ROUNDED)
@@ -2772,15 +2842,16 @@ def run_mtproto_logic(args):
             table.add_row(f"{item[1]} ms", label)
         console.print(table)
 
-    live_count = len([item for item in all_results if item.get("status") == "live"])
-    connect_only_count = len([item for item in all_results if item.get("status") == "connect_only"])
-    drop_count = len([item for item in all_results if item.get("status") == "drop"])
-    unreachable_count = len([item for item in all_results if item.get("status") == "proxy_unreachable"])
-    failed_count = len([item for item in all_results if item.get("status") == "fail"])
+    conn_suffix = (
+        f" CONN sidecar: {runtime_cfg['connect_only_output_file']}."
+        if runtime_cfg.get("save_connect_only", True)
+        else ""
+    )
     safe_print(
         f"\n[bold green]Telegram proxy готово! LIVE: {live_count}. "
-        f"CONN: {connect_only_count}. DROP: {drop_count}. UNREACH: {unreachable_count}. FAIL: {failed_count}. "
-        f"Результат в: {runtime_cfg['output_file']}[/]"
+        f"CONN: {connect_only_count}. DROP: {drop_count}. UNREACH: {unreachable_count}. "
+        f"SOFT: {soft_fail_count}. FAIL: {failed_count}. "
+        f"Результат в: {runtime_cfg['output_file']}.{conn_suffix}[/]"
     )
     if runtime_cfg.get("max_ping_ms", 0) > 0 and drop_count > 0:
         safe_print(
@@ -3202,6 +3273,11 @@ def _render_interactive_status(mt_cfg):
         f"{GLOBAL_CFG.get('output_file', 'sortedProxy.txt')} | "
         f"{mt_cfg.get('output_file', 'sortedMtproto.txt')}"
     )
+    status_grid.add_row(
+        "MTProto Probe",
+        f"{mt_cfg.get('probe_policy', 'balanced')} "
+        f"(connect/rpc retries {mt_cfg.get('connect_retries', 1)}/{mt_cfg.get('rpc_retries', 1)})"
+    )
     console.print(Panel(status_grid, title="Текущее состояние", border_style="dim"))
 
 
@@ -3394,6 +3470,8 @@ def interactive_menu():
                 ("2", "Ping Xray/Mihomo", f"{GLOBAL_CFG.get('max_ping_ms', 500)} ms (0 = off)"),
                 ("3", "Ping MTProto", f"{mt_cfg.get('max_ping_ms', 0)} ms (0 = off)"),
                 ("4", "Crypto MTProto", str(mt_cfg.get("crypto_backend", "auto"))),
+                ("5", "Probe MTProto", f"{mt_cfg.get('probe_policy', 'balanced')} ({mt_cfg.get('connect_retries', 1)}/{mt_cfg.get('rpc_retries', 1)})"),
+                ("6", "CONN MTProto", "save" if _bool_value(mt_cfg.get("save_connect_only", True), True) else "off"),
                 ("0", "Назад", "Вернуться в главное меню"),
             ]
             action = _render_interactive_menu("Настройки", settings_rows)
@@ -3474,6 +3552,60 @@ def interactive_menu():
                 ok, err = save_main_config(GLOBAL_CFG)
                 if ok:
                     safe_print(f"[green]✓ MTProto crypto backend сохранён: {crypto_backend}[/]")
+                else:
+                    safe_print(f"[yellow]Не удалось сохранить конфиг: {err}[/]")
+                time.sleep(1.0)
+                continue
+
+            if action == "5":
+                probe_policy = Prompt.ask(
+                    "MTProto probe policy",
+                    choices=["strict", "balanced", "telegram_like"],
+                    default=str(mt_cfg.get("probe_policy", "balanced"))
+                )
+                try:
+                    connect_retries = int(Prompt.ask(
+                        "MTProto connect retries (0-3)",
+                        default=str(mt_cfg.get("connect_retries", 1))
+                    ))
+                    rpc_retries = int(Prompt.ask(
+                        "MTProto RPC retries (0-3)",
+                        default=str(mt_cfg.get("rpc_retries", 1))
+                    ))
+                    connect_retries = max(0, min(3, connect_retries))
+                    rpc_retries = max(0, min(3, rpc_retries))
+                except Exception:
+                    safe_print("[yellow]Некорректное значение retry[/]")
+                    time.sleep(1.0)
+                    continue
+
+                GLOBAL_CFG.setdefault("mtproto", {})
+                GLOBAL_CFG["mtproto"]["probe_policy"] = probe_policy
+                GLOBAL_CFG["mtproto"]["connect_retries"] = connect_retries
+                GLOBAL_CFG["mtproto"]["rpc_retries"] = rpc_retries
+                ok, err = save_main_config(GLOBAL_CFG)
+                if ok:
+                    safe_print(
+                        f"[green]✓ MTProto probe сохранён: {probe_policy}, "
+                        f"connect/rpc retries={connect_retries}/{rpc_retries}[/]"
+                    )
+                else:
+                    safe_print(f"[yellow]Не удалось сохранить конфиг: {err}[/]")
+                time.sleep(1.0)
+                continue
+
+            if action == "6":
+                save_conn = Confirm.ask(
+                    "Сохранять CONN в отдельный sidecar-файл?",
+                    default=_bool_value(mt_cfg.get("save_connect_only", True), True)
+                )
+                GLOBAL_CFG.setdefault("mtproto", {})
+                GLOBAL_CFG["mtproto"]["save_connect_only"] = save_conn
+                if save_conn and not GLOBAL_CFG["mtproto"].get("connect_only_output_file"):
+                    GLOBAL_CFG["mtproto"]["connect_only_output_file"] = "sortedMtproto.conn.txt"
+                ok, err = save_main_config(GLOBAL_CFG)
+                if ok:
+                    safe_print(f"[green]✓ MTProto CONN sidecar: {'on' if save_conn else 'off'}[/]")
                 else:
                     safe_print(f"[yellow]Не удалось сохранить конфиг: {err}[/]")
                 time.sleep(1.0)

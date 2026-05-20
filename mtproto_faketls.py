@@ -13,11 +13,15 @@ from telethon.network.connection.tcpabridged import AbridgedPacketCodec
 from telethon.network.connection.tcpintermediate import IntermediatePacketCodec
 from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomizedIntermediate
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 P25519 = 2 ** 255 - 19
 BASE64_URLSAFE_RE = re.compile(r"[^a-zA-Z0-9+/_-]+")
 SYSTEM_RANDOM = random.SystemRandom()
+# FakeTLS ClientHello fingerprint aligned with TDLib TlsInit.cpp reviewed on
+# 2026-05-20. The post-ServerHello application-data record is handshake data,
+# not MTProto payload; the first client application-data is preceded by CCS.
+FAKETLS_FINGERPRINT_VERSION = "tdlib-tlsinit-2026-05-20"
 
 
 def _gen_sha256_digest(key, msg):
@@ -139,12 +143,11 @@ class FakeTLSStreamReader:
                 records.append(record)
                 if tls_rec_type == b"\x17":
                     app_data_records += 1
-                    self.buf += record[5:]
                     self._trace(
                         f"handoff after {record_index} TLS records; app_data_records_before_handoff={app_data_records}"
                     )
                     self._trace(
-                        f"consumed app_data#{app_data_records}: payload_len={len(record) - 5} preview={record[5:21].hex()}"
+                        f"consumed server_hello_app_data#{app_data_records}: payload_len={len(record) - 5} preview={record[5:21].hex()}"
                     )
                     return b"".join(records)
                 if tls_rec_type != b"\x14":
@@ -154,12 +157,17 @@ class FakeTLSStreamReader:
 
 
 class FakeTLSStreamWriter:
-    __slots__ = ("upstream",)
+    __slots__ = ("upstream", "first_packet")
 
     def __init__(self, upstream):
         self.upstream = upstream
+        self.first_packet = True
 
     def write(self, data, extra=None):
+        if self.first_packet:
+            self.upstream.write(b"\x14\x03\x03\x00\x01\x01")
+            self.first_packet = False
+
         max_chunk_size = 16384 + 24
         for start in range(0, len(data), max_chunk_size):
             end = min(start + max_chunk_size, len(data))
@@ -335,12 +343,157 @@ class MTProxyFakeTLSClientCodec:
         self.client_random = digest[:28] + xored_time
 
     def build_new_client_hello_packet(self):
-        self.gen_set_session_id()
-        self.gen_set_key_share()
-        self.gen_set_ech_grease()
-        self.gen_set_random()
-        self.pkt = self._build_packet(self.client_random, self._build_extensions())
+        self.pkt = self._build_tdlib_client_hello_packet()
         return self.pkt
+
+    @staticmethod
+    def _make_grease(size=7):
+        grease = bytearray()
+        while len(grease) < size:
+            value = (SYSTEM_RANDOM.randrange(256) & 0xF0) + 0x0A
+            if grease and grease[-1] == value:
+                value ^= 0x10
+            grease.append(value)
+        return bytes(grease)
+
+    @staticmethod
+    def _ml_kem_768_placeholder():
+        # TDLib fills this with an ML-KEM-768 public key. The MTProxy FakeTLS
+        # server authenticates the whole ClientHello via HMAC and does not use
+        # the key material for a real TLS exchange, so random bytes are enough
+        # for checker-side probing.
+        return os.urandom(1184)
+
+    def _build_tdlib_client_hello_packet(self):
+        grease = self._make_grease()
+        session_id = os.urandom(32)
+
+        data = bytearray()
+        scopes = []
+
+        def put(blob):
+            data.extend(blob)
+
+        def begin_scope():
+            scopes.append(len(data))
+            data.extend(b"\x00\x00")
+
+        def end_scope():
+            start = scopes.pop()
+            size = len(data) - start - 2
+            data[start:start + 2] = size.to_bytes(2, "big")
+
+        def grease_pair(seed):
+            value = grease[seed]
+            put(bytes((value, value)))
+
+        def domain():
+            put(bytes(self.domain[:255]))
+
+        def key():
+            put(_gen_x25519_public_key())
+
+        def ml_kem_768_key():
+            put(self._ml_kem_768_placeholder())
+
+        def ech_payload():
+            put(os.urandom(SYSTEM_RANDOM.randrange(0, 4) * 32 + 144))
+
+        def padding():
+            size = 513 - len(data)
+            if size > 0:
+                put(b"\x00\x15")
+                begin_scope()
+                put(b"\x00" * size)
+                end_scope()
+
+        def sni_part():
+            put(b"\x00\x00")
+            begin_scope()
+            begin_scope()
+            put(b"\x00")
+            begin_scope()
+            domain()
+            end_scope()
+            end_scope()
+            end_scope()
+
+        def ech_part():
+            put(b"\xfe\x0d")
+            begin_scope()
+            put(b"\x00\x00\x01\x00\x01")
+            put(os.urandom(1))
+            put(b"\x00\x20")
+            put(os.urandom(32))
+            begin_scope()
+            ech_payload()
+            end_scope()
+            end_scope()
+
+        def key_share_part():
+            put(b"\x00\x33\x04\xef\x04\xed")
+            grease_pair(4)
+            put(b"\x00\x01\x00\x11\xec\x04\xc0")
+            ml_kem_768_key()
+            key()
+            put(b"\x00\x1d\x00\x20")
+            key()
+
+        extension_parts = [
+            lambda: sni_part(),
+            lambda: put(b"\x00\x05\x00\x05\x01\x00\x00\x00\x00"),
+            lambda: (put(b"\x00\x0a\x00\x0c\x00\x0a"), grease_pair(4), put(b"\x11\xec\x00\x1d\x00\x17\x00\x18")),
+            lambda: put(b"\x00\x0b\x00\x02\x01\x00"),
+            lambda: put(b"\x00\x0d\x00\x12\x00\x10\x04\x03\x08\x04\x04\x01\x05\x03\x08\x05\x05\x01\x08\x06\x06\x01"),
+            lambda: put(b"\x00\x10\x00\x0e\x00\x0c\x02\x68\x32\x08\x68\x74\x74\x70\x2f\x31\x2e\x31"),
+            lambda: put(b"\x00\x12\x00\x00"),
+            lambda: put(b"\x00\x17\x00\x00"),
+            lambda: put(b"\x00\x1b\x00\x03\x02\x00\x02"),
+            lambda: put(b"\x00\x23\x00\x00"),
+            lambda: (put(b"\x00\x2b\x00\x07\x06"), grease_pair(6), put(b"\x03\x04\x03\x03")),
+            lambda: put(b"\x00\x2d\x00\x02\x01\x01"),
+            lambda: key_share_part(),
+            lambda: put(b"\x44\xcd\x00\x05\x00\x03\x02\x68\x32"),
+            lambda: ech_part(),
+            lambda: put(b"\xff\x01\x00\x01\x00"),
+        ]
+
+        put(b"\x16\x03\x01")
+        begin_scope()
+        put(b"\x01\x00")
+        begin_scope()
+        put(b"\x03\x03")
+        random_offset = len(data)
+        put(b"\x00" * 32)
+        put(b"\x20")
+        put(session_id)
+        put(
+            b"\x00\x20"
+            + bytes((grease[0], grease[0]))
+            + b"\x13\x01\x13\x02\x13\x03\xc0\x2b\xc0\x2f\xc0\x2c\xc0\x30"
+            + b"\xcc\xa9\xcc\xa8\xc0\x13\xc0\x14\x00\x9c\x00\x9d\x00\x2f\x00\x35\x01\x00"
+        )
+        begin_scope()
+        grease_pair(2)
+        put(b"\x00\x00")
+        SYSTEM_RANDOM.shuffle(extension_parts)
+        for part in extension_parts:
+            part()
+        grease_pair(3)
+        put(b"\x00\x01\x00")
+        padding()
+        end_scope()
+        end_scope()
+        end_scope()
+
+        zero_random_packet = bytes(data)
+        digest = _gen_sha256_digest(self.secret, zero_random_packet)
+        current_time = int(time.time()).to_bytes(length=4, byteorder="little")
+        xored_time = bytes(current_time[i] ^ digest[28 + i] for i in range(4))
+        self.client_random = digest[:28] + xored_time
+        data[random_offset:random_offset + 32] = self.client_random
+        self.session_id = session_id
+        return bytes(data)
 
     def verify_server_hello(self, server_hello):
         try:
@@ -383,6 +536,9 @@ class MTProxyFakeTLSClientCodec:
 class ConnectionTcpMTProxyFakeTLS(ConnectionTcpMTProxyRandomizedIntermediate):
     def __init__(self, ip, port, dc_id, *, loggers, proxy=None, local_addr=None):
         self.fake_tls_codec = MTProxyFakeTLSClientCodec(proxy[2])
+        self.fake_tls_server_hello_verified = False
+        self.fake_tls_application_data_seen = False
+        self.mtproxy_initial_payload_sent = False
 
         proxy_host = proxy[0]
         if len(proxy_host) > 60:
@@ -391,6 +547,10 @@ class ConnectionTcpMTProxyFakeTLS(ConnectionTcpMTProxyRandomizedIntermediate):
         self._trace_label = f"{proxy_host}:{proxy[1]}"
         proxy = (proxy_host, proxy[1], self.fake_tls_codec.secret.hex())
         super().__init__(ip, port, dc_id, loggers=loggers, proxy=proxy, local_addr=local_addr)
+        # Telethon strips textual "dd"/"ee" prefixes while normalizing MTProxy
+        # secrets. FakeTLS uses the inner 16-byte secret verbatim; it may
+        # legitimately start with those bytes.
+        self._secret = self.fake_tls_codec.secret
 
     async def _connect(self, timeout=None, ssl=None):
         if self._local_addr is not None:
@@ -428,12 +588,16 @@ class ConnectionTcpMTProxyFakeTLS(ConnectionTcpMTProxyRandomizedIntermediate):
             trace_prefix=self._trace_label,
         )
 
-        if not self.fake_tls_codec.verify_server_hello(await self._reader.read_server_hello(timeout=timeout)):
+        server_hello = await self._reader.read_server_hello(timeout=timeout)
+        self.fake_tls_application_data_seen = bool(getattr(self._reader, "buf", None))
+        if not self.fake_tls_codec.verify_server_hello(server_hello):
             raise ConnectionError("FakeTLS server hello verification failed")
+        self.fake_tls_server_hello_verified = True
 
         self._codec = self.packet_codec(self)
         self._init_conn()
         await self._writer.drain()
+        self.mtproxy_initial_payload_sent = True
 
         # Give the proxy a brief chance to reject an incompatible packet codec
         # right after the initial payload, mirroring Telethon's MTProxy logic.
