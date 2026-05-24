@@ -13,7 +13,7 @@ from telethon.network.connection.tcpabridged import AbridgedPacketCodec
 from telethon.network.connection.tcpintermediate import IntermediatePacketCodec
 from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomizedIntermediate
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 P25519 = 2 ** 255 - 19
 BASE64_URLSAFE_RE = re.compile(r"[^a-zA-Z0-9+/_-]+")

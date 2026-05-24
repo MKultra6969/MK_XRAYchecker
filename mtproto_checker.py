@@ -21,7 +21,7 @@ from threading import Lock
 
 import requests
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 ALLOWED_CRYPTO_BACKENDS = {"auto", "safe", "unsafe"}
 ALLOWED_PROBE_POLICIES = {"strict", "balanced", "telegram_like"}
 PROBE_POLICY_DEFAULTS = {

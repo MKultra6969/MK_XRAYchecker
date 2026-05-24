@@ -19,7 +19,7 @@
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
 # +═════════════════════════════════════════════════════════════════════════+
-# ║                           VERSION 1.6.0                                 ║
+# ║                           VERSION 1.6.1                                 ║
 # ║             В случае багов/недочётов создайте issue на github           ║
 # ║                                                                         ║
 # +═════════════════════════════════════════════════════════════════════════+
@@ -61,7 +61,7 @@ YAML_WARNED = False
 
 # ВЕРСИЯ СКРИПТА
 # Формат: MAJOR.MINOR.PATCH (SemVer)
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 
 def _ensure_utf8_stdio():
@@ -542,16 +542,7 @@ def _iter_string_values(payload):
             yield from _iter_string_values(item)
 
 def _self_test_clean_url():
-    """
-    Юнит-тест для clean_url(): проверяет корректность декодирования
-    HTML entities и URL encoding для параметров VLESS/REALITY.
-    Запускать: python v2rayChecker.py --self-test
-    
-    Returns:
-        bool: True если все тесты прошли
-    """
     test_cases = [
-        # (входная строка, ожидаемая подстрока после очистки)
         ("vless://test@host:443?security=reality&amp;pbk=ABC&amp;sid=123", "security=reality&pbk=ABC&sid=123"),
         ("vless://test@host:443?security=reality&amp%3Bpbk=ABC", "security=reality&pbk=ABC"),
         ("vless://test@host:443?security=reality%26amp%3Bpbk=ABC", "security=reality&pbk=ABC"),
@@ -655,35 +646,24 @@ def upload_log_to_service(is_crash=False):
         console.print("[red]Файл лога не найден.[/]")
         return None
     
-    console.print("[yellow]📤 Загрузка логов на MK_Paste...[/]")
+    console.print("[yellow]📤 Загрузка логов на paste.rs...[/]")
     
     try:
         with open(log_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
             content = "".join(lines[-1000:])
         
-        payload = {
-            "content": content,
-            "language": "text",
-            "ttl_minutes": 1440,
-            "burn_after_read": False,
-            "visibility": "unlisted",
-            "tags": "v2rayChecker,crash" if is_crash else "v2rayChecker"
-        }
-        
         resp = requests.post(
-            "https://paste.mk69.su/api/paste",
-            json=payload,
-            headers={"User-Agent": "v2rayChecker/1.0"},
-            timeout=20
+            "https://paste.rs",
+            data=content.encode('utf-8'),
+            headers={"Content-Type": "text/plain"},
+            timeout=15
         )
         
         if resp.status_code in (200, 201):
-            data = resp.json()
-            url = f"https://paste.mk69.su{data['url']}"
-            
+            url = resp.text.strip()
             console.print(Panel(
-                f"[bold cyan]{url}[/]\n[dim]Expires in 24h[/]",
+                f"[bold cyan]{url}[/]",
                 title="✅ Upload Success",
                 border_style="green"
             ))
@@ -691,22 +671,6 @@ def upload_log_to_service(is_crash=False):
         else:
             console.print(f"[red]❌ HTTP {resp.status_code}[/]")
             console.print(f"[dim]{resp.text[:200]}[/]")
-            
-            console.print("[yellow]↻ Trying fallback (paste.rs)...[/]")
-            resp_fallback = requests.post(
-                "https://paste.rs",
-                data=content.encode('utf-8'),
-                headers={"Content-Type": "text/plain"},
-                timeout=15
-            )
-            
-            if resp_fallback.status_code in (200, 201):
-                fallback_url = resp_fallback.text.strip()
-                console.print(Panel(
-                    f"[bold green]{fallback_url}[/]",
-                    title="✅ Fallback Success"
-                ))
-                return fallback_url
                 
     except Exception as e:
         console.print(f"[red]❌ Upload failed: {e}[/]")
@@ -730,7 +694,6 @@ def init_temp_dir():
         except Exception:
             continue
 
-    # Последний fallback: текущая директория
     return script_dir
 
 TEMP_DIR = init_temp_dir()
@@ -2312,6 +2275,8 @@ def check_speed_download(local_port, url_file, timeout=10, conn_timeout=5, max_m
         except Exception:
             pass
 
+    return 0.0
+
 def Checker_xray(proxyList, localPortStart, testDomain, timeOut, t2exec, t2kill, 
                  checkSpeed=False, speedUrl="", sortBy="ping", speedCfg=None, 
                  speedSemaphore=None, maxInternalThreads=50, max_ping_ms=0,
@@ -2411,6 +2376,8 @@ def Checker_xray(proxyList, localPortStart, testDomain, timeOut, t2exec, t2kill,
             if checkSpeed:
                 with (speedSemaphore if speedSemaphore else Lock()):
                     proxy_speed = check_speed_download(target_port, speedUrl, **speedCfg)
+                    if proxy_speed is None:
+                        proxy_speed = 0.0
                 sp_color = "green" if proxy_speed > 15 else "yellow" if proxy_speed > 5 else "red"
                 safe_print(f"[green][LIVE][/] [white]{addr_info:<25}[/] | {ping_res:>4}ms | [{sp_color}]{proxy_speed:>5} Mbps[/] | {proxy_tag}")
             else:
@@ -2522,6 +2489,8 @@ def Checker_mihomo(proxyList, localPortStart, testDomain, timeOut, t2exec, t2kil
                 if checkSpeed:
                     with (speedSemaphore if speedSemaphore else Lock()):
                         proxy_speed = check_speed_download(target_port, speedUrl, **speedCfg)
+                        if proxy_speed is None:
+                            proxy_speed = 0.0
                     sp_color = "green" if proxy_speed > 15 else "yellow" if proxy_speed > 5 else "red"
                     safe_print(f"[green][LIVE][/] [white]{addr_info:<25}[/] | {ping_res:>4}ms | [{sp_color}]{proxy_speed:>5} Mbps[/] | {proxy_tag}")
                 else:
