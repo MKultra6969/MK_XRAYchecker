@@ -61,7 +61,7 @@ YAML_WARNED = False
 
 # ВЕРСИЯ СКРИПТА
 # Формат: MAJOR.MINOR.PATCH (SemVer)
-__version__ = "1.6.1"
+__version__ = "1.6.2"
 
 
 def _ensure_utf8_stdio():
@@ -3196,6 +3196,15 @@ def run_logic(args):
     if not full:
         safe_print(f"[bold red]Нет прокси для проверки.[/]")
         return
+
+    has_hysteria2 = any("hysteria2://" in p.lower() or "hy2://" in p.lower() for p in full)
+    
+    if has_hysteria2 and CORE_FLAVOR != "mihomo":
+        safe_print("\n[bold yellow]⚠ ВНИМАНИЕ: В списке для проверки найдены ссылки Hysteria2![/]")
+        safe_print("[bold yellow]Ядро Xray не поддерживает протокол Hysteria2, проверка этих ссылок выдаст 0 (ошибку).[/]")
+        safe_print("[bold yellow]Для проверки Hysteria2 настоятельно рекомендуется переключиться на ядро 'mihomo' (через Настройки -> Ядро).[/]\n")
+    #   print("[DEBUG] Найдена ссылка hysteria2, но ядро не mihomo. Выведен алерт пользователю.")
+        time.sleep(3)
 
     if CORE_FLAVOR == "mihomo":
         # В mihomo режиме 1 процесс = 1 прокси, поэтому лимитируемся числом прокси.
