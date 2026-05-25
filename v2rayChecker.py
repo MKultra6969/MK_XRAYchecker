@@ -19,7 +19,7 @@
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
 # +═════════════════════════════════════════════════════════════════════════+
-# ║                           VERSION 1.6.1                                 ║
+# ║                           VERSION 1.6.3                                 ║
 # ║             В случае багов/недочётов создайте issue на github           ║
 # ║                                                                         ║
 # +═════════════════════════════════════════════════════════════════════════+
@@ -61,7 +61,7 @@ YAML_WARNED = False
 
 # ВЕРСИЯ СКРИПТА
 # Формат: MAJOR.MINOR.PATCH (SemVer)
-__version__ = "1.6.2"
+__version__ = "1.6.3"
 
 
 def _ensure_utf8_stdio():
@@ -3199,33 +3199,36 @@ def run_logic(args):
 
     has_hysteria2 = any("hysteria2://" in p.lower() or "hy2://" in p.lower() for p in full)
     
-    if has_hysteria2 and CORE_FLAVOR != "mihomo":
-        safe_print("\n[bold yellow]⚠ ВНИМАНИЕ: В списке для проверки найдены ссылки Hysteria2![/]")
-        safe_print("[bold yellow]Ядро Xray не поддерживает протокол Hysteria2, проверка этих ссылок выдаст 0 (ошибку).[/]")
-        safe_print("[bold yellow]Для проверки Hysteria2 настоятельно рекомендуется переключиться на ядро 'mihomo' (через Настройки -> Ядро).[/]\n")
-    #   print("[DEBUG] Найдена ссылка hysteria2, но ядро не mihomo. Выведен алерт пользователю.")
-        time.sleep(3)
-
-    if CORE_FLAVOR == "mihomo":
-        # В mihomo режиме 1 процесс = 1 прокси, поэтому лимитируемся числом прокси.
-        threads = min(args.threads, len(full))
-        if threads < 1:
-            threads = 1
-    else:
-        p_per_batch = GLOBAL_CFG.get("proxies_per_batch", 50)
-        needed_cores = (len(full) + p_per_batch - 1) // p_per_batch
-        threads = min(args.threads, needed_cores)
-        if threads < 1:
-            threads = 1
-
-    chunks = list(split_list(full, threads))
-    ports = []
-    curr_p = args.lport
-    for chunk in chunks:
-        ports.append(curr_p)
-        curr_p += len(chunk) + 10 
+    xray_list = full
+    mihomo_list = []
+    mihomo_path = ""
     
+    if has_hysteria2 and CORE_FLAVOR != "mihomo":
+        candidates = build_core_candidates("mihomo")
+        for c in candidates:
+            resolved = shutil.which(c)
+            if resolved:
+                mihomo_path = resolved
+                break
+            if os.path.exists(c):
+                mihomo_path = os.path.abspath(c)
+                break
+        
+        if mihomo_path:
+            xray_list = []
+            for p in full:
+                if "hysteria2://" in p.lower() or "hy2://" in p.lower():
+                    mihomo_list.append(p)
+                else:
+                    xray_list.append(p)
+        else:
+            safe_print("\n[bold yellow]⚠ ВНИМАНИЕ: В списке для проверки найдены ссылки Hysteria2![/]")
+            safe_print("[bold yellow]Ядро Xray не поддерживает протокол Hysteria2, проверка этих ссылок выдаст 0 (ошибку).[/]")
+            safe_print("[bold yellow]Установите mihomo для автоматической проверки hy2.[/]\n")
+            time.sleep(3)
+
     results = []
+    
     try:
         max_ping_ms = int(getattr(args, "max_ping", GLOBAL_CFG.get("max_ping_ms", 0)) or 0)
     except Exception:
@@ -3251,37 +3254,73 @@ def run_logic(args):
         TimeRemainingColumn(),
     ]
 
-    if CORE_FLAVOR == "mihomo":
-        console.print(f"\n[magenta]Запуск {threads} параллельных воркеров для {len(full)} прокси...[/]")
-        console.print("[dim]Mihomo: 1 процесс = 1 прокси одновременно[/]")
-    else:
-        console.print(f"\n[magenta]Запуск {threads} ядер (пачек) для {len(full)} прокси...[/]")
-    if max_ping_ms > 0:
-        console.print(f"[dim]Фильтр ping: <= {max_ping_ms} ms[/]")
-
-    with Progress(*progress_columns, console=console, transient=False) as progress:
-        task_id = progress.add_task("[cyan]Checking proxies...", total=len(full))
-        
-        with ThreadPoolExecutor(max_workers=threads) as executor:
-            futures = []
-            for i in range(len(chunks)):
-                ft = executor.submit(
-                    Checker, chunks[i], ports[i], args.domain, args.timeout, 
-                    args.t2exec, args.t2kill, args.speed_check, args.speed_test_url, args.sort_by,
-                    speed_config_map, speed_semaphore,
-                    GLOBAL_CFG.get("max_internal_threads", 50), max_ping_ms,
-                    progress, task_id
-                )
-                futures.append(ft)
+    def _process_batch(batch_full, override_flavor, override_core_path, base_threads, task_desc):
+        global CORE_FLAVOR, CORE_PATH, CTRL_C
+        if not batch_full:
+            return []
             
-            try:
-                for f in as_completed(futures):
-                    chunk_result = f.result()
-                    if chunk_result:
-                        results.extend(chunk_result)
-            except KeyboardInterrupt:
-                CTRL_C = True
-                executor.shutdown(wait=False)
+        old_flavor = CORE_FLAVOR
+        old_path = CORE_PATH
+        
+        CORE_FLAVOR = override_flavor
+        CORE_PATH = override_core_path
+
+        if CORE_FLAVOR == "mihomo":
+            threads = min(base_threads, len(batch_full))
+            if threads < 1: threads = 1
+            console.print(f"\n[magenta]Запуск {threads} параллельных воркеров (mihomo) для {len(batch_full)} прокси...[/]")
+            console.print("[dim]Mihomo: 1 процесс = 1 прокси одновременно[/]")
+        else:
+            p_per_batch = GLOBAL_CFG.get("proxies_per_batch", 50)
+            needed_cores = (len(batch_full) + p_per_batch - 1) // p_per_batch
+            threads = min(base_threads, needed_cores)
+            if threads < 1: threads = 1
+            console.print(f"\n[magenta]Запуск {threads} ядер (пачек) для {len(batch_full)} прокси...[/]")
+
+        if max_ping_ms > 0:
+            console.print(f"[dim]Фильтр ping: <= {max_ping_ms} ms[/]")
+
+        chunks = list(split_list(batch_full, threads))
+        ports = []
+        curr_p = args.lport
+        for chunk in chunks:
+            ports.append(curr_p)
+            curr_p += len(chunk) + 10 
+            
+        batch_results = []
+        with Progress(*progress_columns, console=console, transient=False) as progress:
+            task_id = progress.add_task(f"[cyan]{task_desc}", total=len(batch_full))
+            
+            with ThreadPoolExecutor(max_workers=threads) as executor:
+                futures = []
+                for i in range(len(chunks)):
+                    ft = executor.submit(
+                        Checker, chunks[i], ports[i], args.domain, args.timeout, 
+                        args.t2exec, args.t2kill, args.speed_check, args.speed_test_url, args.sort_by,
+                        speed_config_map, speed_semaphore,
+                        GLOBAL_CFG.get("max_internal_threads", 50), max_ping_ms,
+                        progress, task_id
+                    )
+                    futures.append(ft)
+                
+                try:
+                    for f in as_completed(futures):
+                        chunk_result = f.result()
+                        if chunk_result:
+                            batch_results.extend(chunk_result)
+                except KeyboardInterrupt:
+                    CTRL_C = True
+                    executor.shutdown(wait=False)
+
+        CORE_FLAVOR = old_flavor
+        CORE_PATH = old_path
+        return batch_results
+
+    if xray_list:
+        results.extend(_process_batch(xray_list, CORE_FLAVOR, CORE_PATH, args.threads, "Checking proxies..."))
+    
+    if mihomo_list:
+        results.extend(_process_batch(mihomo_list, "mihomo", mihomo_path, args.threads, "Checking hy2 proxies (Mihomo)..."))
 
     if args.sort_by == "speed":
         results.sort(key=lambda x: x[2], reverse=True)
