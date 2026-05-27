@@ -19,7 +19,7 @@
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
 # +═════════════════════════════════════════════════════════════════════════+
-# ║                           VERSION 1.6.3                                 ║
+# ║                           VERSION 1.6.4                                 ║
 # ║             В случае багов/недочётов создайте issue на github           ║
 # ║                                                                         ║
 # +═════════════════════════════════════════════════════════════════════════+
@@ -61,7 +61,7 @@ YAML_WARNED = False
 
 # ВЕРСИЯ СКРИПТА
 # Формат: MAJOR.MINOR.PATCH (SemVer)
-__version__ = "1.6.3"
+__version__ = "1.6.4"
 
 
 def _ensure_utf8_stdio():
@@ -91,14 +91,15 @@ FLOW_ALLOWED = {
 }
 
 # -------------------------------
-# Xray Shadowsocks: официально перечисленные поддерживаемые методы (актуально на 2026-01-05)
-SS_ALLOWED_METHODS = {
+# Shadowsocks method allowlists.
+# Xray keeps the stricter subset to avoid Exit 23 on legacy stream ciphers.
+SS_XRAY_ALLOWED_METHODS = {
     # Shadowsocks 2022
     "2022-blake3-aes-128-gcm",
     "2022-blake3-aes-256-gcm",
     "2022-blake3-chacha20-poly1305",
 
-    # AEAD (legacy)
+    # AEAD
     "aes-128-gcm",
     "aes-256-gcm",
     "chacha20-poly1305",
@@ -111,9 +112,34 @@ SS_ALLOWED_METHODS = {
     "plain",
 }
 
-# Устаревшие методы, которые НЕ поддерживаются (для справки):
-# aes-128-cfb, aes-192-cfb, aes-256-cfb, aes-128-ctr, aes-256-ctr,
-# camellia-128-cfb, camellia-256-cfb, rc4-md5, bf-cfb, и т.д.
+# Mihomo accepts the Xray subset plus legacy methods that still appear in public
+# subscriptions and are supported by Mihomo's Shadowsocks implementation.
+SS_MIHOMO_ALLOWED_METHODS = SS_XRAY_ALLOWED_METHODS | {
+    "aes-128-cfb",
+    "aes-192-cfb",
+    "aes-256-cfb",
+    "aes-128-ctr",
+    "aes-192-ctr",
+    "aes-256-ctr",
+    "aes-192-gcm",
+    "rc4-md5",
+    "chacha20",
+    "chacha20-ietf",
+    "xchacha20",
+    "xchacha20-ietf",
+}
+
+# Backward-compatible alias for existing Xray-oriented checks.
+SS_ALLOWED_METHODS = SS_XRAY_ALLOWED_METHODS
+
+def _normalize_ss_method(method):
+    method_lower = (method or "").lower().strip()
+    if method_lower == "chacha20-poly1305":
+        return "chacha20-ietf-poly1305"
+    if method_lower == "xchacha20-poly1305":
+        return "xchacha20-ietf-poly1305"
+    return method_lower
+
 # -------------------------------
 
 try:
@@ -1569,19 +1595,12 @@ def parse_ss(url):
 
         if not address or not port: return None
         
-        method_lower = method.lower().strip()
-        
-        # Алиасы для chacha20
-        if method_lower == "chacha20-poly1305":
-            method_lower = "chacha20-ietf-poly1305"
-        elif method_lower == "xchacha20-poly1305":
-            method_lower = "xchacha20-ietf-poly1305"
-        
-        # Валидация: проверяем что cipher поддерживается Xray
-        # CFB/CTR/OFB stream ciphers вызывают Exit 23!
-        if method_lower not in SS_ALLOWED_METHODS:
+        method_lower = _normalize_ss_method(method)
+
+        # Parse first, then validate against the Mihomo-safe set.
+        if method_lower not in SS_MIHOMO_ALLOWED_METHODS:
             if GLOBAL_CFG.get("debug_mode"):
-                safe_print(f"[yellow][DEBUG] Dropping SS link: unsupported cipher '{method}' (only AEAD allowed)[/]")
+                safe_print(f"[yellow][DEBUG] Dropping SS link: unsupported cipher '{method}'[/]")
             return None
 
         return {
@@ -1716,7 +1735,7 @@ def get_mihomo_proxy_structure(proxy_url, name):
     if not is_valid_port(proxy_conf.get("port")):
         return None
 
-    proto = proxy_conf.get("protocol")
+    proto = str(proxy_conf.get("protocol") or "").lower()
     if proto in ("vless", "vmess") and not is_valid_uuid(proxy_conf.get("uuid")):
         return None
 
@@ -1732,11 +1751,11 @@ def get_mihomo_proxy_structure(proxy_url, name):
     security = (proxy_conf.get("security") or "none").lower()
     sni = proxy_conf.get("sni") or proxy_conf.get("host") or ""
 
-    if proto == "ss":
-        method = (proxy_conf.get("method") or "").lower().strip()
-        if method == "xchacha20-poly1305":
-            method = "xchacha20-ietf-poly1305"
-        if method not in SS_ALLOWED_METHODS:
+    if proto in ("ss", "shadowsocks"):
+        method = _normalize_ss_method(proxy_conf.get("method"))
+        if method not in SS_MIHOMO_ALLOWED_METHODS:
+            if GLOBAL_CFG.get("debug_mode"):
+                safe_print(f"[yellow][DEBUG] Skipping SS link for Mihomo: unsupported cipher '{method}'[/]")
             return None
         base.update({
             "type": "ss",
@@ -1950,9 +1969,11 @@ def get_outbound_structure(proxy_url, tag):
         }
         
         if proxy_conf["protocol"] == "shadowsocks":
-            method = proxy_conf["method"].lower()
-            if "chacha20-ietf" in method and "poly1305" not in method:
-                method = "chacha20-ietf-poly1305"
+            method = _normalize_ss_method(proxy_conf.get("method"))
+            if method not in SS_XRAY_ALLOWED_METHODS:
+                if GLOBAL_CFG.get("debug_mode"):
+                    safe_print(f"[yellow][DEBUG] Skipping SS link for Xray: unsupported cipher '{method}'[/]")
+                return None
             outbound["settings"] = {
                 "servers": [{
                     "address": proxy_conf["address"],
