@@ -19,7 +19,7 @@
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
 # +═════════════════════════════════════════════════════════════════════════+
-# ║                           VERSION 1.6.4                                 ║
+# ║                           VERSION 1.7.0                                 ║
 # ║             В случае багов/недочётов создайте issue на github           ║
 # ║                                                                         ║
 # +═════════════════════════════════════════════════════════════════════════+
@@ -61,7 +61,7 @@ YAML_WARNED = False
 
 # ВЕРСИЯ СКРИПТА
 # Формат: MAJOR.MINOR.PATCH (SemVer)
-__version__ = "1.6.4"
+__version__ = "1.7.0"
 
 
 def _ensure_utf8_stdio():
@@ -1234,7 +1234,8 @@ def _extract_subscription_links(payload):
     return links
 
 def parse_content(text):
-    unique_links = set()
+    # ponytail: canonical dedupe via parsed-proxy key (drops query order/trash/fragment)
+    seen = {}
     raw_hits = 0
 
     for payload in _payload_variants(text):
@@ -1244,16 +1245,16 @@ def parse_content(text):
             for item in sub_links:
                 cleaned = clean_url(item.rstrip(';,)]}'))
                 if cleaned and len(cleaned) > 15:
-                    unique_links.add(cleaned)
+                    seen[canonical_proxy_key(cleaned)] = cleaned
 
         matches = URL_FINDER.findall(payload)
         raw_hits += len(matches)
         for item in matches:
             cleaned = clean_url(item.rstrip(';,)]}'))
             if cleaned and len(cleaned) > 15:
-                unique_links.add(cleaned)
+                seen[canonical_proxy_key(cleaned)] = cleaned
 
-    return sorted(unique_links), raw_hits or len(unique_links)
+    return sorted(seen.values()), raw_hits or len(seen)
 
 def extract_subscription_urls(text):
     urls = set()
@@ -1325,7 +1326,7 @@ def parse_vless(url):
         params = {}
         if '?' in main_part:
             query = main_part.split('?', 1)[1]
-            query = re.split(r'[^\w\-\=\&\%(\.)]', query)[0]
+            query = re.split(r'[^\w\-\=\&\%(\./+)]', query)[0]
             params = urllib.parse.parse_qs(query)
 
         def get_p(key, default=""):
@@ -1415,6 +1416,12 @@ def parse_vless(url):
             "sid": sid,
             "flow": flow,
             "headerType": get_p("headerType", ""),
+            "spiderX": get_p("spx", "") or get_p("spiderX", "") or "/",
+            "pqv": get_p("pqv", ""),
+            "pcs": get_p("pcs", ""),
+            "packet_encoding": get_p("packetEncoding", "") or get_p("packet-encoding", ""),
+            "ed": get_p("ed", ""),
+            "ech": get_p("ech", ""),
             "tag": tag
         }
     except Exception as e:
@@ -1478,6 +1485,8 @@ def parse_vmess(url):
                     "serviceName": get_p("serviceName", ""),
                     "aid": aid,
                     "scy": get_p("encryption", "auto"),
+                    "ech": get_p("ech", ""),
+                    "ed": get_p("ed", ""),
                     "tag": tag
                 }
 
@@ -1519,6 +1528,8 @@ def parse_vmess(url):
                 "fp": data.get("fp", ""),
                 "alpn": data.get("alpn", ""),
                 "scy": data.get("scy", "auto"),
+                "ech": data.get("ech", ""),
+                "ed": str(data.get("ed", "")),
                 "tag": data.get("ps", tag)
             }
         except:
@@ -1553,6 +1564,8 @@ def parse_trojan(url):
             "type": params.get("type", ["tcp"])[0],
             "path": params.get("path", [""])[0],
             "host": params.get("host", [""])[0],
+            "ech": params.get("ech", [""])[0],
+            "ed": params.get("ed", [""])[0],
             "tag": urllib.parse.unquote(tag).strip()
         }
     except: return None
@@ -1636,7 +1649,8 @@ def parse_hysteria2(url):
             "sni": params.get("sni", [""])[0],
             "insecure": params.get("insecure", ["0"])[0] == "1",
             "obfs": params.get("obfs", ["none"])[0],
-            "obfs_password": params.get("obfs-password", [""])[0],
+            "obfs_password": params.get("obfs-password", [""])[0] or params.get("obfsPassword", [""])[0],
+            "alpn": params.get("alpn", [""])[0],
             "tag": urllib.parse.unquote(tag).strip()
         }
     except: return None
@@ -1658,6 +1672,23 @@ def parse_proxy_url(proxy_url):
         return None
     return None
 
+def canonical_proxy_key(proxy_url):
+    # ponytail: canonical key on parsed dict (drops tag/fragment/query order),
+    # fallback to fragment-stripped string for unsupported links
+    try:
+        parsed = parse_proxy_url(proxy_url)
+        if parsed:
+            normalized = {k: v for k, v in parsed.items() if k != "tag"}
+            return "parsed:" + json.dumps(normalized, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        pass
+    try:
+        import urllib.parse as _up
+        parts = _up.urlsplit(proxy_url or "")
+        return "fallback:" + _up.urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ""))
+    except Exception:
+        return "fallback:" + str(proxy_url or "")
+
 def _mihomo_network_opts(proxy_conf):
     raw_type = (proxy_conf.get("raw_type") or proxy_conf.get("type") or "tcp").lower()
     raw_type = re.sub(r"[^a-z0-9]", "", raw_type)
@@ -1675,6 +1706,12 @@ def _mihomo_network_opts(proxy_conf):
         ws_opts = {"path": path}
         if host:
             ws_opts["headers"] = {"Host": host}
+        try:
+            ed_int = int(proxy_conf.get("ed") or 0)
+            if ed_int > 0:
+                ws_opts["max-early-data"] = ed_int
+        except (TypeError, ValueError):
+            pass
         return {
             "network": "ws",
             "ws-opts": ws_opts
@@ -1792,6 +1829,8 @@ def get_mihomo_proxy_structure(proxy_url, name):
             base["obfs"] = proxy_conf["obfs"]
             if proxy_conf.get("obfs_password"):
                 base["obfs-password"] = proxy_conf["obfs_password"]
+        if proxy_conf.get("alpn"):
+            base["alpn"] = [a.strip() for a in str(proxy_conf["alpn"]).split(",") if a.strip()]
         return base
 
     if proto == "vmess":
@@ -1808,6 +1847,11 @@ def get_mihomo_proxy_structure(proxy_url, name):
         })
         if proxy_conf.get("flow"):
             base["flow"] = proxy_conf["flow"]
+        if proxy_conf.get("packet_encoding"):
+            base["packet-encoding"] = proxy_conf["packet_encoding"]
+        enc = (proxy_conf.get("encryption") or "none").strip()
+        if enc and enc != "none":
+            base["encryption"] = enc
     else:
         return None
 
@@ -1818,6 +1862,8 @@ def get_mihomo_proxy_structure(proxy_url, name):
             base["servername"] = sni
         fp = (proxy_conf.get("fp") or "").strip()
         base["client-fingerprint"] = fp if fp else "chrome"
+        if proxy_conf.get("ech"):
+            base["ech-opts"] = {"enable": True, "config": proxy_conf["ech"]}
 
     if security == "reality":
         pbk = proxy_conf.get("pbk", "").strip()
@@ -1827,6 +1873,8 @@ def get_mihomo_proxy_structure(proxy_url, name):
         sid = (proxy_conf.get("sid") or "").strip()
         if sid:
             reality_opts["short-id"] = sid
+        if _bool_value(proxy_conf.get("pcs")):
+            reality_opts["support-x25519mlkem768"] = True
         base["reality-opts"] = reality_opts
 
     base.update(transport or {})
@@ -1918,6 +1966,8 @@ def get_outbound_structure(proxy_url, tag):
                 tls_settings["alpn"] = alpn_val
             
             if security == "tls":
+                if proxy_conf.get("ech"):
+                    tls_settings["echConfigList"] = proxy_conf["ech"]
                 streamSettings["tlsSettings"] = tls_settings
             elif security == "reality":
                 if not proxy_conf.get("pbk"): 
@@ -1925,13 +1975,16 @@ def get_outbound_structure(proxy_url, tag):
                 s_id = proxy_conf.get("sid", "")
                 if len(s_id) % 2 != 0: 
                     s_id = ""
-                streamSettings["realitySettings"] = {
+                reality_settings = {
                     "publicKey": proxy_conf.get("pbk"),
                     "shortId": s_id,
                     "serverName": tls_settings["serverName"],
                     "fingerprint": tls_settings["fingerprint"],
-                    "spiderX": "/"
+                    "spiderX": proxy_conf.get("spiderX") or "/"
                 }
+                if proxy_conf.get("pqv"):
+                    reality_settings["mldsa65Verify"] = proxy_conf["pqv"]
+                streamSettings["realitySettings"] = reality_settings
             
             path = proxy_conf.get("path") or "/"
             host = proxy_conf.get("host") or ""
@@ -2005,21 +2058,25 @@ def get_outbound_structure(proxy_url, tag):
                     "password": proxy_conf.get("obfs_password", "")
                 }
             outbound["settings"] = {"vnext": [hy2_settings]}
+            hy2_tls = {
+                "serverName": proxy_conf.get("sni", ""),
+                "allowInsecure": True,
+                "fingerprint": "chrome"
+            }
+            raw_alpn = proxy_conf.get("alpn", "")
+            if raw_alpn:
+                alpn_list = raw_alpn if isinstance(raw_alpn, list) else [a.strip() for a in str(raw_alpn).split(",") if a.strip()]
+                if alpn_list:
+                    hy2_tls["alpn"] = alpn_list
             outbound["streamSettings"] = {
                 "security": "tls",
-                "tlsSettings": {
-                    "serverName": proxy_conf.get("sni", ""),
-                    "allowInsecure": True,
-                    "fingerprint": "chrome"
-                }
+                "tlsSettings": hy2_tls
             }
-            if alpn_val: 
-                outbound["streamSettings"]["tlsSettings"]["alpn"] = alpn_val
         else:
             vnext_user = {
                 "id": proxy_conf["uuid"],
                 "alterId": proxy_conf.get("aid", 0),
-                "encryption": "none"
+                "encryption": (proxy_conf.get("encryption") or "none") if proxy_conf["protocol"] == "vless" else "none"
             }
             if proxy_conf["protocol"] == "vless" and proxy_conf.get("flow"):
                 vnext_user["flow"] = proxy_conf.get("flow")
@@ -2219,6 +2276,42 @@ def kill_core(proc):
         except:
             pass
 
+# ponytail: regex + drop helper for Xray batch auto-repair.
+# Tag scheme stays out_{port} so we can map it back to valid_mapping.
+_BAD_OUTBOUND_TAG_RE = re.compile(
+    r'failed to build outbound config with tag\s*[:=]?\s*["\']?(out_\d+)',
+    re.IGNORECASE,
+)
+
+def extract_bad_outbound_tag(log_text):
+    """Return the offending outbound tag (e.g. 'out_10000') from a core log, or None."""
+    if not log_text:
+        return None
+    m = _BAD_OUTBOUND_TAG_RE.search(log_text)
+    return m.group(1) if m else None
+
+def drop_proxy_by_outbound_tag(active_proxy_list, valid_mapping, out_tag):
+    """Drop the proxy whose mapped port matches `out_tag`.
+
+    Returns (new_list, dropped_url) without mutating `active_proxy_list`.
+    `dropped_url` is None when the tag maps to nothing (unrecognized/bad).
+    """
+    if not out_tag:
+        return list(active_proxy_list), None
+    try:
+        target_port = int(out_tag.split("_", 1)[1])
+    except (IndexError, ValueError):
+        return list(active_proxy_list), None
+    dropped_url = None
+    for url, port in valid_mapping or []:
+        if port == target_port:
+            dropped_url = url
+            break
+    if dropped_url is None:
+        return list(active_proxy_list), None
+    new_list = [u for u in active_proxy_list if u != dropped_url]
+    return new_list, dropped_url
+
 def check_connection(local_port, domain, timeout):
     proxies = {
         'http': f'socks5://127.0.0.1:{local_port}',
@@ -2306,73 +2399,112 @@ def Checker_xray(proxyList, localPortStart, testDomain, timeOut, t2exec, t2kill,
     current_live_results = []
     if speedCfg is None: speedCfg = {}
 
-    configPath, valid_mapping, err = create_batch_config_file(proxyList, localPortStart, TEMP_DIR)
-    if err or not valid_mapping:
-        return current_live_results
-
-    proc = run_core(CORE_PATH, configPath)
-    if not proc:
-        safe_print(f"[bold red][BATCH ERROR] Не удалось создать процесс ядра![/]")
-        return current_live_results
-
+    # Working copy so the caller's proxyList is never mutated by batch repair.
+    active_proxy_list = list(proxyList)
+    proc = None
+    configPath = None
+    valid_mapping = []
     core_started = False
-    start_time = time.time()
-    max_wait = max(t2exec, 5.0)
-    while (time.time() - start_time) < max_wait:
-        poll_result = proc.poll()
-        if poll_result is not None:
-            exitcode = proc.returncode
-            if exitcode == 0: break
-            
-            try:
-                out_data, _ = proc.communicate(timeout=1)
-                if out_data:
-                     error_msg = out_data.strip()[-2000:] 
-            except Exception as e:
-                error_msg = f"Failed to read error output: {e}"
-            
-            safe_print(f"[bold red]BATCH FAILED[/] [yellow]Ядро не запустилось (Exit: {exitcode})[/]")
-            safe_print(f"[dim]Error: {error_msg[:300]}[/]")
-            
-            save_failed_batch(configPath, error_msg, exitcode)
-            
-            kill_core(proc)
+
+    # Retry loop: rebuild+relaunch the batch, dropping one bad outbound per
+    # recognized failure, until the core starts, the list is empty, or the
+    # error is unrecognized.
+    while active_proxy_list:
+        configPath, valid_mapping, err = create_batch_config_file(
+            active_proxy_list, localPortStart, TEMP_DIR
+        )
+        if err or not valid_mapping:
             return current_live_results
-        if is_port_in_use(valid_mapping[0][1]):
-            core_started = True
+
+        proc = run_core(CORE_PATH, configPath)
+        if not proc:
+            safe_print(f"[bold red][BATCH ERROR] Не удалось создать процесс ядра![/]")
+            return current_live_results
+
+        # Post-start probe: detect early exit (with exit/error msg) vs port open.
+        core_started = False
+        error_msg = ""
+        exitcode = None
+        start_time = time.time()
+        max_wait = max(t2exec, 5.0)
+        while (time.time() - start_time) < max_wait:
+            poll_result = proc.poll()
+            if poll_result is not None:
+                exitcode = proc.returncode
+                if exitcode == 0:
+                    break
+                try:
+                    out_data, _ = proc.communicate(timeout=1)
+                    if out_data:
+                        error_msg = out_data.strip()[-2000:]
+                except Exception as e:
+                    error_msg = f"Failed to read error output: {e}"
+                break
+            if is_port_in_use(valid_mapping[0][1]):
+                core_started = True
+                break
+            time.sleep(0.1)
+
+        if core_started:
+            time.sleep(0.3)
             break
-        time.sleep(0.1)
 
-    if core_started:
-        time.sleep(0.3)
-
-    if not core_started:
-        exitcode = proc.poll()
-        error_msg = "Unknown error"
-        try:
-            if proc.stdout:
-                err_lines = []
-                for line in proc.stdout:
-                    err_lines.append(line.strip())
-                    if len(err_lines) > 50:
-                        break
-                if err_lines:
-                    error_msg = "\n".join(err_lines[-20:])
-        except:
+        # Did not start: preserve old stdout fallback before killing.
+        if exitcode is None:
+            exitcode = proc.poll()
+            error_msg = "Unknown error"
             try:
-                proc.wait(timeout=0.5)
-                error_msg = "Core failed silently"
-            except:
-                error_msg = "Core timeout"
-        
+                if proc.stdout:
+                    err_lines = []
+                    for line in proc.stdout:
+                        err_lines.append(line.strip())
+                        if len(err_lines) > 50:
+                            break
+                    if err_lines:
+                        error_msg = "\n".join(err_lines[-20:])
+            except Exception:
+                try:
+                    proc.wait(timeout=0.5)
+                    error_msg = "Core failed silently"
+                except Exception:
+                    error_msg = "Core timeout"
+
+        kill_core(proc)
+        proc = None
+
+        bad_tag = extract_bad_outbound_tag(error_msg)
+        if bad_tag:
+            new_list, dropped = drop_proxy_by_outbound_tag(
+                active_proxy_list, valid_mapping, bad_tag
+            )
+            if dropped is not None:
+                safe_print(
+                    f"[yellow][BATCH REPAIR][/] отбрасываю битый outbound "
+                    f"{bad_tag} ({dropped})"
+                )
+                if progress and task_id is not None:
+                    progress.advance(task_id, 1)
+                try:
+                    if configPath and os.path.exists(configPath):
+                        os.remove(configPath)
+                except Exception:
+                    pass
+                active_proxy_list = new_list
+                continue
+
+        # Unrecognized failure: save the failed batch (old debug behavior).
         safe_print(f"[bold red]BATCH FAILED[/] [yellow]Ядро не запустилось (Exit: {exitcode})[/]")
         safe_print(f"[dim]Error: {error_msg[:300]}[/]")
-        
-        save_failed_batch(configPath, error_msg, exitcode)
-            
-        exit_code = proc.poll()
-        
-        kill_core(proc)
+        save_failed_batch(configPath, error_msg, exitcode if exitcode is not None else 0)
+        try:
+            if configPath and os.path.exists(configPath):
+                os.remove(configPath)
+        except Exception:
+            pass
+        return current_live_results
+
+    # Loop exited because active_proxy_list is empty: nothing left to check.
+    if not active_proxy_list:
         return current_live_results
     
     def check_single_port(item):
