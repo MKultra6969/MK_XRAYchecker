@@ -2045,8 +2045,8 @@ def create_batch_config_file(proxy_list, start_port, work_dir):
     
     for i, url in enumerate(proxy_list):
         port = start_port + i
-        in_tag = f"in_{port}"
-        out_tag = f"out_{port}"
+        in_tag = f"in_{i}"
+        out_tag = f"out_{i}"
         
         out_struct = get_outbound_structure(url, out_tag)
         if not out_struct: 
@@ -2305,76 +2305,58 @@ def Checker_xray(proxyList, localPortStart, testDomain, timeOut, t2exec, t2kill,
     
     current_live_results = []
     if speedCfg is None: speedCfg = {}
-
-    configPath, valid_mapping, err = create_batch_config_file(proxyList, localPortStart, TEMP_DIR)
-    if err or not valid_mapping:
-        return current_live_results
-
-    proc = run_core(CORE_PATH, configPath)
-    if not proc:
-        safe_print(f"[bold red][BATCH ERROR] Не удалось создать процесс ядра![/]")
-        return current_live_results
-
+    proc = None
+    valid_mapping = None
     core_started = False
-    start_time = time.time()
     max_wait = max(t2exec, 5.0)
-    while (time.time() - start_time) < max_wait:
-        poll_result = proc.poll()
-        if poll_result is not None:
-            exitcode = proc.returncode
-            if exitcode == 0: break
-            
-            try:
-                out_data, _ = proc.communicate(timeout=1)
-                if out_data:
-                     error_msg = out_data.strip()[-2000:] 
-            except Exception as e:
-                error_msg = f"Failed to read error output: {e}"
-            
-            safe_print(f"[bold red]BATCH FAILED[/] [yellow]Ядро не запустилось (Exit: {exitcode})[/]")
-            safe_print(f"[dim]Error: {error_msg[:300]}[/]")
-            
-            save_failed_batch(configPath, error_msg, exitcode)
-            
-            kill_core(proc)
+    while proxyList:
+        error_msg = ""
+        exitcode = None
+        configPath, valid_mapping, err = create_batch_config_file(proxyList, localPortStart, TEMP_DIR)
+        if err or not valid_mapping:
             return current_live_results
-        if is_port_in_use(valid_mapping[0][1]):
-            core_started = True
-            break
-        time.sleep(0.1)
 
-    if core_started:
-        time.sleep(0.3)
+        proc = run_core(CORE_PATH, configPath)
+        if not proc:
+            safe_print(f"[bold red][BATCH ERROR] Не удалось создать процесс ядра![/]")
+            return current_live_results
 
-    if not core_started:
-        exitcode = proc.poll()
-        error_msg = "Unknown error"
-        try:
-            if proc.stdout:
-                err_lines = []
-                for line in proc.stdout:
-                    err_lines.append(line.strip())
-                    if len(err_lines) > 50:
-                        break
-                if err_lines:
-                    error_msg = "\n".join(err_lines[-20:])
-        except:
-            try:
-                proc.wait(timeout=0.5)
-                error_msg = "Core failed silently"
-            except:
-                error_msg = "Core timeout"
-        
-        safe_print(f"[bold red]BATCH FAILED[/] [yellow]Ядро не запустилось (Exit: {exitcode})[/]")
-        safe_print(f"[dim]Error: {error_msg[:300]}[/]")
-        
-        save_failed_batch(configPath, error_msg, exitcode)
+        start_time = time.time()
+        while (time.time() - start_time) < max_wait:
+            poll_result = proc.poll()
+            if poll_result is not None:
+                exitcode = proc.returncode
+                if exitcode == 0: break
             
-        exit_code = proc.poll()
-        
-        kill_core(proc)
+                try:
+                    out_data, _ = proc.communicate(timeout=1)
+                    if out_data:
+                         error_msg = out_data.strip()
+                except Exception as e:
+                    error_msg = f"Failed to read error output: {e}"
+                break
+            if is_port_in_use(valid_mapping[0][1]):
+                core_started = True
+                break
+            time.sleep(0.1)
+
+        if core_started:
+            time.sleep(0.3)
+            break
+        else:
+            m = re.search(r"failed to build outbound config with tag out_(\d+)", error_msg)
+            kill_core(proc)
+            if m:
+                bad_i = int(m.group(1))
+                safe_print(f"[bold red][BATCH ERROR] УДАЛЕНО: {proxyList[bad_i]} [/]")
+                del proxyList[bad_i]
+                continue
+            else:
+                safe_print(f"[bold red]BATCH FAILED[/] [yellow]Автоисправление не удалось. Ядро не запустилось. [/]")
+                save_failed_batch(configPath, error_msg.strip()[-2000:], exitcode)
+                return current_live_results
+    else:
         return current_live_results
-    
     def check_single_port(item):
         if CTRL_C: return None
         target_url, target_port = item
