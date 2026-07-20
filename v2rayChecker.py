@@ -2266,6 +2266,25 @@ def check_speed_download(local_port, url_file, timeout=10, conn_timeout=5, max_m
             pass
 
     return 0.0
+def check_min_version(core_path, min_version):
+    try:
+        output = subprocess.run(
+            [core_path, "-version"],
+            capture_output=True, text=True, check=False, timeout=5
+        ).stdout
+    except Exception as e:
+        safe_print(f"[bold red][VERSION ERROR] Не удалось запустить ядро для проверки версии: {e}[/]")
+        return False
+
+    match = re.search(r'\d+\.\d+\.\d+', output)
+    if not match:
+        safe_print(f"[bold red][VERSION ERROR] Не удалось найти версию в выводе '{core_path} -version'[/]")
+        return False
+
+    version = tuple(map(int, match.group().split('.')))
+    min_ver = tuple(map(int, min_version.split('.')))
+
+    return version >= min_ver
 
 def Checker_xray(proxyList, localPortStart, testDomain, timeOut, t2exec, t2kill, 
                  checkSpeed=False, speedUrl="", sortBy="ping", speedCfg=None, 
@@ -3137,6 +3156,15 @@ def run_logic(args):
         return
 
     safe_print(f"[dim]Core detected: {CORE_PATH} ({CORE_FLAVOR})[/]")
+    MIN_CORE_VERSION = {
+        "xray": "26.3.27",
+        "mihomo": "0.0.0", # михома иди нахуй
+    }
+    
+    min_ver = MIN_CORE_VERSION.get(CORE_FLAVOR)
+    if not check_min_version(CORE_PATH, min_ver):
+        safe_print(f"[bold red][VERSION ERROR] Версия ядра {CORE_FLAVOR} ниже минимально требуемой ({min_ver}). Обновите ядро[/]")
+        return
     safe_print(f"[dim]Engine mode: {requested_engine}[/]")
     if router_mode:
         safe_print(f"[bold cyan]Router mode: ВКЛ[/] [dim](safe cleanup: {cleanup_mode})[/]")
