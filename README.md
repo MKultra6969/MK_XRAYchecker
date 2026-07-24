@@ -8,7 +8,7 @@
 
 <p>
   <a href="https://github.com/MKultra6969/MK_XRAYchecker">
-    <img src="https://img.shields.io/badge/VERSION-1.7.0-magenta?style=for-the-badge&logo=python" alt="Version">
+    <img src="https://img.shields.io/badge/VERSION-1.8.0-magenta?style=for-the-badge&logo=python" alt="Version">
   </a>
   <a href="http://www.wtfpl.net/">
     <img src="https://img.shields.io/badge/LICENSE-WTFPL-red?style=for-the-badge" alt="License">
@@ -31,7 +31,7 @@
 Отдельно добавлен **MTProto checker** для Telegram proxy (`tg://proxy`, `t.me/proxy`) с собственной логикой проверки через Telegram API. Он **не использует** `Xray/Mihomo` и работает как отдельный режим.
 
 ### 🔥 Возможности
-*   **Поддержка протоколов:** `VMess`, `VLESS`, `Trojan`, `Shadowsocks`, `Hysteria2`.
+*   **Поддержка протоколов:** `VLESS`, `VMess`, `Trojan`, `Shadowsocks`, `Hysteria2`, `AnyTLS`, `TUIC`, а также native Mihomo YAML-типы.
 *   **Отдельный MTProto checker:** проверка Telegram proxy (`tg://proxy`, `t.me/proxy`) через реальный MTProto handshake и Telegram RPC probe.
 *   **MTProto Promo:** умеет читать `help.getPromoData` через авторизованную Telethon session и показывать promo-канал в логе, таблице и sidecar JSON.
 *   **Парсинг:** Извлекает прокси из "каши" текста, Base64 строк, ссылок-подписок. 
@@ -97,6 +97,16 @@
 > - `bin/xray.exe` или `bin/xray`
 > - `bin/mihomo.exe` или `bin/mihomo`
 > - `aggregator.py` (опционально, для `--agg`)
+
+### Политика поддержки протоколов (Issue #14)
+
+- Ядро выбирается по capabilities конкретной ссылки: безопасные совместимые конфиги идут в Xray, остальные — в Mihomo; один protocol не означает безусловный выбор одного ядра.
+- Production baseline — Xray `v26.3.27`; Xray `v26.7.11` используется только как отдельный pre-release compatibility lane. Основной Mihomo baseline — `v1.19.29`.
+- Для Mihomo YAML сохраняются документированные native mappings (включая YAML-only типы); собственные share URI для WireGuard, SSH, Snell, ShadowQUIC и других YAML-only типов не создаются.
+- Поддерживаются converter-форматы Mihomo `ssr://`, `hysteria://`, `socks://`/`socks5://`, явные `http(s)://` proxy и `mierus://`; HTTP(S) не извлекаются автоматически из смешанного текста, потому что неотличимы от URL подписки без контекста.
+- Realm-варианты Hysteria с `lport` принимаются только когда поле представимо текущим checker-конфигом; иначе возвращается явное ограничение, без silent drop.
+- Устаревшие transport-форматы принимаются как compatibility input, когда преобразование однозначно; удалённые или небезопасные варианты получают диагностируемый unsupported result.
+- Неизвестные query-параметры сохраняются в диагностических metadata и предупреждениях, но не влияют на canonical key, если не меняют generated config.
 
 ---
 

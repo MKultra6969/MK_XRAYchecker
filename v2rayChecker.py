@@ -19,7 +19,7 @@
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
 # +═════════════════════════════════════════════════════════════════════════+
-# ║                           VERSION 1.7.0                                 ║
+# ║                           VERSION 1.8.0                                 ║
 # ║             В случае багов/недочётов создайте issue на github           ║
 # ║                                                                         ║
 # +═════════════════════════════════════════════════════════════════════════+
@@ -61,7 +61,7 @@ YAML_WARNED = False
 
 # ВЕРСИЯ СКРИПТА
 # Формат: MAJOR.MINOR.PATCH (SemVer)
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 
 def _ensure_utf8_stdio():
@@ -481,12 +481,20 @@ def load_config():
 
 GLOBAL_CFG = load_config()
 
-PROTO_HINTS = ("vless://", "vmess://", "trojan://", "hysteria2://", "hy2://", "ss://")
+PROTO_HINTS = ("vless://", "vmess://", "trojan://", "hysteria2://", "hy2://", "anytls://", "tuic://", "ss://", "ssr://", "hysteria://", "socks://", "socks5://", "socks5h://", "http://", "https://", "mierus://")
+
+MIHOMO_NATIVE_TYPES = frozenset({
+    "ss", "shadowsocks", "ssr", "vmess", "vless", "trojan", "hysteria", "hysteria2", "hy2",
+    "anytls", "tuic", "socks5", "http", "https", "mieru", "wireguard", "ssh", "snell",
+    "shadowquic", "sudoku", "masque", "trusttunnel", "openvpn", "tailscale",
+})
 
 BASE64_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-")
 
 URL_FINDER = re.compile(
-    r'(?:vless|vmess|trojan|hysteria2|hy2)://[^\s"\'<>]+|(?<![A-Za-z0-9+])ss://[^\s"\'<>]+',
+    r'(?:hysteria2\+realm\+http|hysteria2\+realm|vless|vmess|trojan|hysteria2|hy2|anytls|tuic|ssr|hysteria|socks|socks5|socks5h|mierus)://[^\s"\'<>]+'
+    r'|(?<![A-Za-z0-9+])ss://[^\s"\'<>]+'
+    r'|https?://[^\s"\'<>/@]+@[^\s"\'<>/]+:\d+[^\s"\'<>]*',
     re.IGNORECASE
 )
 
@@ -1218,43 +1226,67 @@ def _extract_subscription_links(payload):
         if not isinstance(proxy, dict):
             continue
         ptype = _first_scalar(proxy.get("type"), "").lower()
-        link = None
-        if ptype == "vmess":
-            link = _build_subscription_vmess(proxy)
-        elif ptype == "vless":
-            link = _build_subscription_vless(proxy)
-        elif ptype == "trojan":
-            link = _build_subscription_trojan(proxy)
-        elif ptype in ("ss", "shadowsocks"):
-            link = _build_subscription_ss(proxy)
-        elif ptype in ("hysteria2", "hy2"):
-            link = _build_subscription_hysteria2(proxy)
-        if link:
-            links.append(link)
+        if not ptype:
+            continue
+        native = copy.deepcopy(proxy)
+        native["_native_mihomo"] = True
+        if ptype not in MIHOMO_NATIVE_TYPES:
+            native["_unsupported"] = f"unknown Mihomo proxy type: {ptype}"
+        links.append(native)
     return links
-
+def _merge_proxy_entries(mapping, entries):
+    for entry in entries:
+        mapping[canonical_proxy_key(entry)] = entry
 def parse_content(text):
     # ponytail: canonical dedupe via parsed-proxy key (drops query order/trash/fragment)
     seen = {}
     raw_hits = 0
+
+    for line in str(text or "").splitlines():
+        try:
+            native = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(native, dict) and native.get("type"):
+            native["_native_mihomo"] = True
+            if str(native["type"]).lower() not in MIHOMO_NATIVE_TYPES:
+                native["_unsupported"] = f"unknown Mihomo proxy type: {native['type']}"
+            seen[canonical_proxy_key(native)] = native
+            raw_hits += 1
 
     for payload in _payload_variants(text):
         sub_links = _extract_subscription_links(payload)
         if sub_links:
             raw_hits += len(sub_links)
             for item in sub_links:
-                cleaned = clean_url(item.rstrip(';,)]}'))
+                if isinstance(item, dict):
+                    seen[canonical_proxy_key(item)] = item
+                    continue
+                cleaned = html.unescape(item.rstrip(';,)]}').strip())
                 if cleaned and len(cleaned) > 15:
                     seen[canonical_proxy_key(cleaned)] = cleaned
 
         matches = URL_FINDER.findall(payload)
         raw_hits += len(matches)
         for item in matches:
-            cleaned = clean_url(item.rstrip(';,)]}'))
+            cleaned = html.unescape(item.rstrip(';,)]}').strip())
             if cleaned and len(cleaned) > 15:
+                if cleaned.lower().startswith("mierus://"):
+                    expanded = parse_mierus_entries(cleaned)
+                    if expanded:
+                        raw_hits += len(expanded) - 1
+                        for native in expanded:
+                            seen[canonical_proxy_key(native)] = native
+                        continue
                 seen[canonical_proxy_key(cleaned)] = cleaned
 
-    return sorted(seen.values()), raw_hits or len(seen)
+    return list(seen.values()), raw_hits or len(seen)
+
+def _is_authenticated_http_proxy(value):
+    try:
+        return "@" in urllib.parse.urlsplit(value).netloc and parse_mihomo_auth_uri(value) is not None
+    except Exception:
+        return False
 
 def extract_subscription_urls(text):
     urls = set()
@@ -1268,16 +1300,22 @@ def extract_subscription_urls(text):
             payload = None
         if payload is not None:
             for value in _iter_string_values(payload):
+                if _is_authenticated_http_proxy(value):
+                    continue
                 cleaned = normalize_http_url(value)
                 if cleaned:
                     urls.add(cleaned)
                     continue
                 for match in HTTP_URL_FINDER.findall(value):
+                    if _is_authenticated_http_proxy(match):
+                        continue
                     cleaned = normalize_http_url(match)
                     if cleaned:
                         urls.add(cleaned)
 
     for match in HTTP_URL_FINDER.findall(raw_text):
+        if _is_authenticated_http_proxy(match):
+            continue
         cleaned = normalize_http_url(match)
         if cleaned:
             urls.add(cleaned)
@@ -1302,193 +1340,192 @@ def fetch_url(url):
         safe_print(f"{Fore.RED}>> Ошибка URL: {e}{Style.RESET_ALL}")
     return []
     
-def parse_vless(url):
+def _uri_parts(url, schemes, known=(), repeat=(), default_port=443):
+    """Parse proxy URIs once; query decoding deliberately keeps '+' in credentials."""
     try:
-        url = clean_url(url)
-        if not url.startswith("vless://"): return None
+        # clean_url() decodes the whole URI and would turn encoded @/&/# into syntax.
+        raw_url = html.unescape(str(url).strip().replace("\ufeff", "").replace("\u200b", "").replace("\n", "").replace("\r", ""))
+        parsed = urllib.parse.urlsplit(raw_url)
+        if parsed.scheme.lower() not in schemes or not parsed.hostname:
+            return None
+        try:
+            port = parsed.port or default_port
+            authority_ports = ""
+        except ValueError:  # Hysteria2 port hopping lives in the URI authority.
+            if parsed.scheme.lower() not in ("hysteria2", "hy2"):
+                return None
+            authority = parsed.netloc.rsplit("@", 1)[-1]
+            port_text = authority.rsplit(":", 1)[-1]
+            ranges = port_text.split(",")
+            if not ranges:
+                return None
+            for item in ranges:
+                bounds = item.split("-", 1)
+                if any(not is_valid_port(bound) for bound in bounds) or (len(bounds) == 2 and int(bounds[0]) > int(bounds[1])):
+                    return None
+            first_port = ranges[0].split("-", 1)[0]
+            port, authority_ports = int(first_port), port_text
+        if not is_valid_port(port):
+            return None
+        values, unknown = {}, []
+        for item in filter(None, parsed.query.split("&")):
+            key, sep, value = item.partition("=")
+            key, value = urllib.parse.unquote(key), urllib.parse.unquote(value if sep else "")
+            if key in values and key in known and key not in repeat:
+                return None
+            if key in known:
+                values.setdefault(key, []).append(value)
+            else:
+                unknown.append(f"{key}={value}" if sep else key)
+        if authority_ports:
+            values["_authority_ports"] = [authority_ports]
+        raw_userinfo = parsed.netloc.rsplit("@", 1)[0] if "@" in parsed.netloc else ""
+        return parsed, values, unknown, raw_userinfo, port
+    except Exception:
+        return None
 
-        main_part = url
-        tag = "vless"
-        if '#' in url:
-            parts = url.split('#', 1)
-            main_part = parts[0]
-            tag = urllib.parse.unquote(parts[1]).strip()
+def _uri_value(values, *keys, default=""):
+    for key in keys:
+        if values.get(key):
+            return values[key][0].strip()
+    return default
 
-        if '¬' in main_part: main_part = main_part.split('¬')[0]
+def _b64url_length(value, length):
+    try:
+        return bool(re.fullmatch(r"[A-Za-z0-9_-]+", value)) and len(base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))) == length
+    except Exception:
+        return False
 
-        match = re.search(r'vless://([^@]+)@([^:]+):(\d+)', main_part)
-        if not match: return None
+def _valid_vless_encryption(value):
+    if value == "none":
+        return True
+    parts = value.split(".")
+    if len(parts) < 4 or parts[0] != "mlkem768x25519plus" or parts[1] not in ("native", "xorpub", "random") or parts[2] not in ("0rtt", "1rtt"):
+        return False
+    keys_started = False
+    max_padding = 0
+    for index, part in enumerate(parts[3:]):
+        if len(part) >= 20:
+            keys_started = True
+            if not (_b64url_length(part, 32) or _b64url_length(part, 1184)):
+                return False
+            continue
+        if keys_started or not re.fullmatch(r"\d+-\d+-\d+", part):
+            return False
+        chance, low, high = map(int, part.split("-"))
+        if chance > 100 or low > high or (index == 0 and (chance < 100 or min(low, high) < 35)):
+            return False
+        if index % 2 == 0:
+            max_padding += high
+            if max_padding > 65553:
+                return False
+    return keys_started
 
-        uuid = match.group(1).strip()
-        address = match.group(2).strip()
-        port = int(match.group(3))
-
-        params = {}
-        if '?' in main_part:
-            query = main_part.split('?', 1)[1]
-            query = re.split(r'[^\w\-\=\&\%(\./+)]', query)[0]
-            params = urllib.parse.parse_qs(query)
-
-        def get_p(key, default=""):
-            val = params.get(key, [default])
-            v = val[0].strip()
-            return re.sub(r'[^\x20-\x7E]', '', v) if v else default
-        
-        raw_net_type = get_p("type", "tcp").lower()
-        raw_net_type = re.sub(r"[^a-z0-9]", "", raw_net_type)
-        if not raw_net_type:
-            raw_net_type = "tcp"
-        net_type = raw_net_type
-        if net_type in ["http", "h2"]:
-            net_type = "xhttp"
-        elif net_type == "httpupgrade":
-            net_type = "xhttp"
-
-        flow = get_p("flow", "").lower().strip()
-        flow = FLOW_ALIASES.get(flow, flow)
-        
-        if flow in ["none", "xtls-rprx-direct", "xtls-rprx-origin", 
-                    "xtls-rprx-splice", "xtls-rprx-direct-udp443"]:
-            flow = ""
-        
-        if flow not in FLOW_ALLOWED:
-            flow = ""
-        
-        security = get_p("security", "none").lower()
-        if security not in ["tls", "reality", "none", "auto"]:
-            security = "none"
-        
-        if flow and security not in ["tls", "reality"]:
-            if GLOBAL_CFG.get("debug_mode"):
-                safe_print(f"[yellow][DEBUG] Dropping flow={flow} for security={security} (flow requires tls/reality)[/]")
-            flow = ""
-
-        pbk = get_p("pbk", "")
-        # ВАЛИДАЦИЯ: Строгая проверка X25519 ключа (base64url -> 32 байта)
-        if pbk:
-            try:
-                missing_padding = len(pbk) % 4
-                pbk_padded = pbk + '=' * (4 - missing_padding) if missing_padding else pbk
-                
-                decoded = base64.urlsafe_b64decode(pbk_padded)
-                
-                if len(decoded) != 32:
-                    if GLOBAL_CFG.get("debug_mode"):
-                        safe_print(f"[yellow][DEBUG] Dropping invalid PBK (len{len(decoded)}!=32): {pbk}[/]")
-                    pbk = ""
-            except Exception as e:
-                if GLOBAL_CFG.get("debug_mode"):
-                    safe_print(f"[yellow][DEBUG] Dropping invalid PBK (decode error): {pbk} ({e})[/]")
-                pbk = ""
-
-        if pbk and security == "tls":
-            security = "reality"
-
-        sid = get_p("sid", "")
-        # Валидация ShortId: должен быть hex и чётной длины
-        if sid:
-            sid = re.sub(r"[^0-9a-fA-F]", "", sid)
-            if len(sid) % 2 != 0:
-                if GLOBAL_CFG.get("debug_mode"):
-                    safe_print(f"[yellow][DEBUG] Fixing odd SID length {len(sid)}: {sid} -> 0{sid}[/]")
-                sid = "0" + sid
-            
-            if not REALITY_SID_RE.match(sid):
-                sid = ""
-
-        return {
+def parse_vless(url):
+    known = ("encryption", "security", "sni", "fp", "pbk", "sid", "type", "flow", "path", "host", "alpn", "serviceName", "mode", "headerType", "spx", "spiderX", "pqv", "pcs", "packetEncoding", "packet-encoding", "ed", "ech", "fm", "extra", "vcn")
+    uri = _uri_parts(url, ("vless",), known)
+    if not uri:
+        return None
+    parsed, params, unknown, userinfo, port = uri
+    uuid = urllib.parse.unquote(userinfo)
+    pbk, sid, pqv = _uri_value(params, "pbk"), _uri_value(params, "sid"), _uri_value(params, "pqv")
+    if pbk and not _b64url_length(pbk, 32):
+        return None
+    if sid and (not re.fullmatch(r"[0-9a-fA-F]{0,16}", sid) or len(sid) % 2):
+        return None
+    if pqv and not _b64url_length(pqv, 1952):
+        return None
+    pcs = _uri_value(params, "pcs")
+    if pcs and any(not re.fullmatch(r"[0-9a-fA-F]{64}", pin) for pin in pcs.split(",")):
+        return None
+    spx = _uri_value(params, "spx", "spiderX", default="/")
+    if not spx.startswith("/"):
+        return None
+    encryption = _uri_value(params, "encryption", default="none")
+    if not _valid_vless_encryption(encryption):
+        return None
+    def json_object(key):
+        value = _uri_value(params, key)
+        if not value:
+            return None
+        try:
+            decoded = json.loads(value)
+            return decoded if isinstance(decoded, dict) else False
+        except (TypeError, ValueError):
+            return False
+    fm, extra = json_object("fm"), json_object("extra")
+    if fm is False or extra is False:
+        return None
+    raw_net_type = _uri_value(params, "type", default="tcp").lower()
+    net_type = {"tcp": "raw", "splithttp": "xhttp", "mkcp": "kcp"}.get(raw_net_type, raw_net_type)
+    flow = FLOW_ALIASES.get(_uri_value(params, "flow").lower(), _uri_value(params, "flow").lower())
+    if flow not in FLOW_ALLOWED:
+        return None
+    security = _uri_value(params, "security", default="none").lower()
+    if security not in ("tls", "reality", "none", "auto"):
+        return None
+    if flow and security not in ("tls", "reality"):
+        return None
+    return {
             "protocol": "vless",
             "uuid": uuid,
-            "address": address,
+            "address": parsed.hostname,
             "port": port,
-            "encryption": get_p("encryption", "none"),
+            "encryption": encryption,
             "type": net_type,
             "raw_type": raw_net_type,
             "security": security,
-            "path": urllib.parse.unquote(get_p("path", "")),
-            "host": get_p("host", ""),
-            "sni": get_p("sni", ""),
-            "fp": get_p("fp", ""),
-            "alpn": get_p("alpn", ""),
-            "serviceName": get_p("serviceName", ""),
-            "mode": get_p("mode", ""),
+            "path": _uri_value(params, "path"), "host": _uri_value(params, "host"), "sni": _uri_value(params, "sni"),
+            "fp": _uri_value(params, "fp"), "alpn": _uri_value(params, "alpn"), "serviceName": _uri_value(params, "serviceName"), "mode": _uri_value(params, "mode"),
             "pbk": pbk,
             "sid": sid,
             "flow": flow,
-            "headerType": get_p("headerType", ""),
-            "spiderX": get_p("spx", "") or get_p("spiderX", "") or "/",
-            "pqv": get_p("pqv", ""),
-            "pcs": get_p("pcs", ""),
-            "packet_encoding": get_p("packetEncoding", "") or get_p("packet-encoding", ""),
-            "ed": get_p("ed", ""),
-            "ech": get_p("ech", ""),
-            "tag": tag
+            "headerType": _uri_value(params, "headerType"), "spiderX": spx, "pqv": pqv, "pcs": pcs,
+            "packet_encoding": _uri_value(params, "packetEncoding", "packet-encoding"), "ed": _uri_value(params, "ed"),
+            "ech": _uri_value(params, "ech"), "fm": fm, "extra": extra, "vcn": _uri_value(params, "vcn"),
+            "tag": urllib.parse.unquote(parsed.fragment).strip(), "diagnostics": [f"unknown query: {key}" for key in unknown]
         }
-    except Exception as e:
-        return None
-
 def parse_vmess(url):
     try:
-        url = clean_url(url)
+        url = html.unescape(str(url).strip().replace("\ufeff", "").replace("\u200b", "").replace("\n", "").replace("\r", ""))
         if not url.startswith("vmess://"): return None
 
         if '@' in url:
-            if '#' in url:
-                main_part, tag = url.split('#', 1)
-                tag = urllib.parse.unquote(tag).strip()
-            else:
-                main_part = url
-                tag = "vmess"
-
-            match = re.search(r'vmess://([^@]+)@([^:]+):(\d+)', main_part)
-            if match:
-                uuid = match.group(1).strip()
-                address = match.group(2).strip()
-                port = int(match.group(3))
-
-                params = {}
-                if '?' in main_part:
-                    query = main_part.split('?', 1)[1]
-                    params = urllib.parse.parse_qs(query)
-
-                def get_p(key, default=""):
-                    val = params.get(key, [default])
-                    return val[0] if val else default
-                
-                try: aid = int(get_p("aid", "0"))
-                except: aid = 0
-                
-                raw_path = get_p("path", "")
-                final_path = urllib.parse.unquote(raw_path)
-
-                raw_net_type = get_p("type", "tcp").lower()
-                raw_net_type = re.sub(r"[^a-z0-9]", "", raw_net_type)
-                if not raw_net_type:
-                    raw_net_type = "tcp"
-                net_type = raw_net_type
-                if net_type in ["http", "h2", "httpupgrade"]:
-                    net_type = "xhttp"
-            
-                return {
-                    "protocol": "vmess",
-                    "uuid": uuid,
-                    "address": address,
-                    "port": int(port),
-                    "type": net_type,
-                    "raw_type": raw_net_type,
-                    "security": get_p("security", "none"),
-                    "path": final_path,
-                    "host": get_p("host", ""),
-                    "sni": get_p("sni", ""),
-                    "fp": get_p("fp", ""),
-                    "alpn": get_p("alpn", ""),
-                    "serviceName": get_p("serviceName", ""),
-                    "aid": aid,
-                    "scy": get_p("encryption", "auto"),
-                    "ech": get_p("ech", ""),
-                    "ed": get_p("ed", ""),
-                    "tag": tag
-                }
+            known = ("aid", "type", "security", "path", "host", "sni", "fp", "alpn", "serviceName", "encryption", "ech", "ed")
+            uri = _uri_parts(url, ("vmess",), known)
+            if not uri:
+                return None
+            parsed, params, unknown, userinfo, port = uri
+            try:
+                aid = int(_uri_value(params, "aid", default="0"))
+            except (TypeError, ValueError):
+                return None
+            cipher = _uri_value(params, "encryption", default="auto").lower()
+            if cipher not in ("auto", "aes-128-gcm", "chacha20-poly1305", "none", "zero"):
+                return None
+            raw_net_type = re.sub(r"[^a-z0-9]", "", _uri_value(params, "type", default="tcp").lower()) or "tcp"
+            net_type = "xhttp" if raw_net_type in ("http", "h2", "httpupgrade") else raw_net_type
+            return {
+                "protocol": "vmess",
+                "uuid": urllib.parse.unquote(userinfo),
+                "address": parsed.hostname,
+                "port": port,
+                "type": net_type,
+                "raw_type": raw_net_type,
+                "security": _uri_value(params, "security", default="none"),
+                "path": _uri_value(params, "path"),
+                "host": _uri_value(params, "host"),
+                "sni": _uri_value(params, "sni"),
+                "fp": _uri_value(params, "fp"),
+                "alpn": _uri_value(params, "alpn"),
+                "serviceName": _uri_value(params, "serviceName"),
+                "aid": aid,
+                "scy": cipher,
+                "ech": _uri_value(params, "ech"),
+                "ed": _uri_value(params, "ed"),
+                "tag": urllib.parse.unquote(parsed.fragment).strip(),
+                "diagnostics": [f"unknown query: {key}" for key in unknown],
+            }
 
         content = url[8:]
         if '#' in content:
@@ -1502,8 +1539,11 @@ def parse_vmess(url):
         if missing_padding: b64 += '=' * (4 - missing_padding)
         
         try:
-            decoded = base64.b64decode(b64).decode('utf-8', errors='ignore')
+            decoded = base64.urlsafe_b64decode(b64).decode('utf-8', errors='ignore')
             data = json.loads(decoded)
+            cipher = str(data.get("scy", "auto")).lower()
+            if cipher not in ("auto", "aes-128-gcm", "chacha20-poly1305", "none", "zero"):
+                return None
             
             raw_net_type = str(data.get("net", "tcp")).lower()
             raw_net_type = re.sub(r"[^a-z0-9]", "", raw_net_type)
@@ -1527,7 +1567,7 @@ def parse_vmess(url):
                 "sni": data.get("sni", ""),
                 "fp": data.get("fp", ""),
                 "alpn": data.get("alpn", ""),
-                "scy": data.get("scy", "auto"),
+                "scy": cipher,
                 "ech": data.get("ech", ""),
                 "ed": str(data.get("ed", "")),
                 "tag": data.get("ps", tag)
@@ -1541,34 +1581,23 @@ def parse_vmess(url):
         return None
     
 def parse_trojan(url):
-    try:
-        if '#' in url:
-            url_clean, tag = url.split('#', 1)
-        else:
-            url_clean = url
-            tag = "trojan"
-        
-        parsed = urllib.parse.urlparse(url_clean)
-        params = urllib.parse.parse_qs(parsed.query)
-        
-        if not parsed.hostname or not parsed.port:
-            return None
-
-        return {
+    uri = _uri_parts(url, ("trojan",), ("security", "sni", "peer", "type", "path", "host", "ech", "ed", "flow"))
+    if not uri:
+        return None
+    parsed, params, unknown, userinfo, port = uri
+    security = _uri_value(params, "security", default="tls").lower()
+    if security not in ("tls", "reality"):
+        return None
+    return {
             "protocol": "trojan",
-            "uuid": parsed.username,
+            "uuid": urllib.parse.unquote(userinfo),
             "address": parsed.hostname,
-            "port": int(parsed.port),
-            "security": params.get("security", ["tls"])[0],
-            "sni": params.get("sni", [""])[0] or params.get("peer", [""])[0],
-            "type": params.get("type", ["tcp"])[0],
-            "path": params.get("path", [""])[0],
-            "host": params.get("host", [""])[0],
-            "ech": params.get("ech", [""])[0],
-            "ed": params.get("ed", [""])[0],
-            "tag": urllib.parse.unquote(tag).strip()
+            "port": port, "security": security,
+            "sni": _uri_value(params, "sni", "peer"), "type": _uri_value(params, "type", default="tcp"),
+            "path": _uri_value(params, "path"), "host": _uri_value(params, "host"), "ech": _uri_value(params, "ech"),
+            "ed": _uri_value(params, "ed"), "flow": _uri_value(params, "flow"), "tag": urllib.parse.unquote(parsed.fragment).strip(),
+            "diagnostics": [f"unknown query: {key}" for key in unknown]
         }
-    except: return None
 
 def parse_ss(url):
     try:
@@ -1579,14 +1608,14 @@ def parse_ss(url):
             tag = "ss"
         
         parsed = urllib.parse.urlparse(url_clean)
-        
+
         if '@' in url_clean:
-            userinfo = parsed.username
+            userinfo = urllib.parse.unquote(parsed.username or "")
             try:
                 if userinfo and ':' not in userinfo:
                     missing_padding = len(userinfo) % 4
                     if missing_padding: userinfo += '=' * (4 - missing_padding)
-                    decoded_info = base64.b64decode(userinfo).decode('utf-8')
+                    decoded_info = base64.urlsafe_b64decode(userinfo).decode('utf-8')
                 else:
                     decoded_info = userinfo
             except:
@@ -1600,7 +1629,7 @@ def parse_ss(url):
             b64 = url_clean.replace("ss://", "")
             missing_padding = len(b64) % 4
             if missing_padding: b64 += '=' * (4 - missing_padding)
-            decoded = base64.b64decode(b64).decode('utf-8')
+            decoded = base64.urlsafe_b64decode(b64).decode('utf-8')
             if '@' not in decoded: return None
             method_pass, addr_port = decoded.rsplit('@', 1)
             method, password = method_pass.split(':', 1)
@@ -1627,37 +1656,212 @@ def parse_ss(url):
     except: return None
 
 def parse_hysteria2(url):
-    try:
-        url = url.replace("hy2://", "hysteria2://")
-        if '#' in url:
-            url_clean, tag = url.split('#', 1)
-        else:
-            url_clean = url
-            tag = "hy2"
-            
-        parsed = urllib.parse.urlparse(url_clean)
-        params = urllib.parse.parse_qs(parsed.query)
-        
-        if not parsed.hostname or not parsed.port:
+    known = ("obfs", "obfs-password", "obfsPassword", "obfs-min-packet-size", "obfs-max-packet-size", "sni", "insecure", "pinSHA256", "ech", "alpn", "up", "down", "mport", "mportHopInt", "auth", "stun", "lport")
+    uri = _uri_parts(url, ("hysteria2", "hy2", "hysteria2+realm", "hysteria2+realm+http"), known, repeat=("stun",))
+    if not uri:
+        return None
+    parsed, params, unknown, userinfo, port = uri
+    obfs = _uri_value(params, "obfs", default="none").lower()
+    if obfs not in ("none", "salamander", "gecko") or _uri_value(params, "insecure", default="0") not in ("0", "1"):
+        return None
+    obfs_password = _uri_value(params, "obfs-password", "obfsPassword")
+    if obfs != "none" and not obfs_password:
+        return None
+    gecko_min = _uri_value(params, "obfs-min-packet-size")
+    gecko_max = _uri_value(params, "obfs-max-packet-size")
+    if gecko_min or gecko_max:
+        if obfs != "gecko" or not (gecko_min.isdigit() and gecko_max.isdigit()) or int(gecko_min) > int(gecko_max):
             return None
-
-        return {
+    lport = _uri_value(params, "lport")
+    if lport and not is_valid_port(lport):
+        return None
+    realm = parsed.scheme.startswith("hysteria2+realm")
+    if realm and (not _uri_value(params, "auth") or not parsed.path):
+        return None
+    return {
             "protocol": "hysteria2",
-            "uuid": parsed.username,
+            "uuid": _uri_value(params, "auth") if realm else urllib.parse.unquote(userinfo),
             "address": parsed.hostname,
-            "port": int(parsed.port),
-            "sni": params.get("sni", [""])[0],
-            "insecure": params.get("insecure", ["0"])[0] == "1",
-            "obfs": params.get("obfs", ["none"])[0],
-            "obfs_password": params.get("obfs-password", [""])[0] or params.get("obfsPassword", [""])[0],
-            "alpn": params.get("alpn", [""])[0],
-            "tag": urllib.parse.unquote(tag).strip()
+            "port": port, "sni": _uri_value(params, "sni"), "insecure": _uri_value(params, "insecure", default="0") == "1",
+            "obfs": obfs, "obfs_password": obfs_password, "alpn": _uri_value(params, "alpn"),
+            "fingerprint": _uri_value(params, "pinSHA256"), "ech": _uri_value(params, "ech"),
+            "ports": _uri_value(params, "_authority_ports", "mport"), "hop_interval": _uri_value(params, "mportHopInt"),
+            "up": _uri_value(params, "up"), "down": _uri_value(params, "down"),
+            "obfs_min_packet_size": gecko_min, "obfs_max_packet_size": gecko_max,
+            "realm": urllib.parse.unquote(parsed.path.lstrip("/")) if realm else "", "realm_http": parsed.scheme.endswith("+http"),
+            "rendezvous": urllib.parse.unquote(userinfo) if realm else "", "stun": params.get("stun", []), "lport": _uri_value(params, "lport"),
+            "tag": urllib.parse.unquote(parsed.fragment).strip(), "diagnostics": [f"unknown query: {key}" for key in unknown]
         }
-    except: return None
+
+def parse_anytls(url):
+    uri = _uri_parts(url, ("anytls",), ("sni", "insecure", "hpkp", "ech", "udp", "security", "reality"))
+    if not uri:
+        return None
+    parsed, params, unknown, userinfo, port = uri
+    if (_uri_value(params, "insecure", default="0") not in ("0", "1")
+            or _uri_value(params, "reality")
+            or _uri_value(params, "security").lower() == "reality"):
+        return None
+    return {"protocol": "anytls", "uuid": urllib.parse.unquote(userinfo), "address": parsed.hostname, "port": port,
+            "sni": _uri_value(params, "sni"), "insecure": _uri_value(params, "insecure", default="0") == "1",
+            "fingerprint": _uri_value(params, "hpkp"), "ech": _uri_value(params, "ech"), "udp": _uri_value(params, "udp"),
+            "tag": urllib.parse.unquote(parsed.fragment).strip(), "diagnostics": [f"unknown query: {key}" for key in unknown]}
+
+def parse_tuic(url):
+    uri = _uri_parts(url, ("tuic",), ("congestion_control", "alpn", "sni", "disable_sni", "udp_relay_mode"))
+    if not uri:
+        return None
+    parsed, params, unknown, userinfo, port = uri
+    userinfo = urllib.parse.unquote(userinfo)
+    if not userinfo:
+        return None
+    if ":" in userinfo:
+        uuid, password = userinfo.split(":", 1)
+        version = 5
+    else:
+        uuid, password, version = userinfo, "", 4
+    return {"protocol": "tuic", "uuid": uuid, "password": password, "version": version, "address": parsed.hostname, "port": port,
+            "congestion_controller": _uri_value(params, "congestion_control"), "alpn": _uri_value(params, "alpn"),
+            "sni": _uri_value(params, "sni"), "disable_sni": _uri_value(params, "disable_sni"), "udp_relay_mode": _uri_value(params, "udp_relay_mode"),
+            "tag": urllib.parse.unquote(parsed.fragment).strip(), "diagnostics": [f"unknown query: {key}" for key in unknown]}
+
+def _decode_urlsafe_text(value):
+    try:
+        value += "=" * (-len(value) % 4)
+        return base64.urlsafe_b64decode(value).decode("utf-8")
+    except Exception:
+        return ""
+
+def parse_mihomo_auth_uri(url):
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in ("socks", "socks5", "socks5h", "http", "https") or not parsed.hostname:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if not is_valid_port(port):
+        return None
+    native = {
+        "type": "http" if scheme in ("http", "https") else "socks5",
+        "server": parsed.hostname,
+        "port": port,
+        "skip-cert-verify": True,
+        "_native_mihomo": True,
+    }
+    userinfo = parsed.netloc.rsplit("@", 1)[0] if "@" in parsed.netloc else ""
+    if userinfo:
+        decoded = _decode_urlsafe_text(userinfo) or urllib.parse.unquote(userinfo)
+        username, sep, password = decoded.partition(":")
+        native["username"] = username
+        native["password"] = password if sep else ""
+    if scheme == "https":
+        native["tls"] = True
+    if parsed.fragment:
+        native["name"] = urllib.parse.unquote(parsed.fragment)
+    return native
+
+def parse_hysteria1(url):
+    known = ("peer", "obfs", "alpn", "auth", "protocol", "up", "down", "upmbps", "downmbps", "insecure")
+    uri = _uri_parts(url, ("hysteria",), known)
+    if not uri:
+        return None
+    parsed, params, unknown, _userinfo, port = uri
+    if _uri_value(params, "insecure", default="0") not in ("0", "1", "true", "false"):
+        return None
+    up = _uri_value(params, "up", "upmbps")
+    down = _uri_value(params, "down", "downmbps")
+    if not up or not down:
+        return None
+    native = {
+        "type": "hysteria",
+        "server": parsed.hostname,
+        "port": port,
+        "sni": _uri_value(params, "peer"),
+        "obfs": _uri_value(params, "obfs"),
+        "auth_str": _uri_value(params, "auth"),
+        "protocol": _uri_value(params, "protocol"),
+        "up": up,
+        "down": down,
+        "skip-cert-verify": _uri_value(params, "insecure", default="0") in ("1", "true"),
+        "_native_mihomo": True,
+        "diagnostics": [f"unknown query: {key}" for key in unknown],
+    }
+    if _uri_value(params, "alpn"):
+        native["alpn"] = [item for item in _uri_value(params, "alpn").split(",") if item]
+    if parsed.fragment:
+        native["name"] = urllib.parse.unquote(parsed.fragment)
+    return native
+
+def parse_ssr(url):
+    decoded = _decode_urlsafe_text(url.split("://", 1)[-1])
+    before, separator, query = decoded.partition("/?")
+    parts = before.split(":")
+    if not separator or len(parts) != 6 or not is_valid_port(parts[1]):
+        return None
+    host, port, protocol, method, obfs, password = parts
+    params = urllib.parse.parse_qs(query, keep_blank_values=True)
+    native = {
+        "type": "ssr", "server": host, "port": int(port), "protocol": protocol,
+        "cipher": method, "obfs": obfs, "password": _decode_urlsafe_text(password),
+        "udp": True, "_native_mihomo": True,
+    }
+    for source, target in (("obfsparam", "obfs-param"), ("protoparam", "protocol-param")):
+        if params.get(source):
+            native[target] = _decode_urlsafe_text(params[source][0])
+    if params.get("remarks"):
+        native["name"] = _decode_urlsafe_text(params["remarks"][0])
+    return native
+
+def parse_mierus_entries(url):
+    known = ("port", "protocol", "profile", "multiplexing", "handshake-mode", "traffic-pattern")
+    uri = _uri_parts(url, ("mierus",), known, repeat=("port", "protocol"))
+    if not uri:
+        return []
+    parsed, params, unknown, userinfo, _port = uri
+    ports, protocols = params.get("port", []), params.get("protocol", [])
+    if not ports or len(ports) != len(protocols):
+        return []
+    username, separator, password = urllib.parse.unquote(userinfo).partition(":")
+    base_name = urllib.parse.unquote(parsed.fragment) or _uri_value(params, "profile") or parsed.hostname
+    entries = []
+    for port, protocol in zip(ports, protocols):
+        native = {
+            "type": "mieru", "server": parsed.hostname, "transport": protocol,
+            "udp": True, "username": username, "password": password if separator else "",
+            "_native_mihomo": True, "diagnostics": [f"unknown query: {key}" for key in unknown],
+            "name": f"{base_name}:{port}/{protocol}",
+        }
+        if "-" in port:
+            start, separator, end = port.partition("-")
+            if not separator or not (is_valid_port(start) and is_valid_port(end)) or int(start) > int(end):
+                return []
+            native["port-range"] = port
+        elif is_valid_port(port):
+            native["port"] = int(port)
+        else:
+            return []
+        for key in ("multiplexing", "handshake-mode", "traffic-pattern"):
+            if _uri_value(params, key):
+                native[key] = _uri_value(params, key)
+        entries.append(native)
+    return entries
+
+def parse_mierus(url):
+    entries = parse_mierus_entries(url)
+    if len(entries) == 1:
+        return entries[0]
+    if entries:
+        return {"protocol": "unsupported", "diagnostics": ["multi-profile mierus URI must be expanded during content parsing"]}
+    return None
 
 def parse_proxy_url(proxy_url):
     try:
-        proxy_url = clean_url(proxy_url)
+        if isinstance(proxy_url, dict) and proxy_url.get("_native_mihomo"):
+            return proxy_url
+        # Keep percent-encoded URI delimiters intact until component parsing.
+        proxy_url = html.unescape(str(proxy_url).strip().replace("\ufeff", "").replace("\u200b", "").replace("\n", "").replace("\r", ""))
         if proxy_url.startswith("vless://"):
             return parse_vless(proxy_url)
         if proxy_url.startswith("vmess://"):
@@ -1666,8 +1870,20 @@ def parse_proxy_url(proxy_url):
             return parse_trojan(proxy_url)
         if proxy_url.startswith("ss://"):
             return parse_ss(proxy_url)
-        if proxy_url.startswith("hy"):
+        if proxy_url.startswith(("hysteria2://", "hy2://", "hysteria2+realm://", "hysteria2+realm+http://")):
             return parse_hysteria2(proxy_url)
+        if proxy_url.startswith("anytls://"):
+            return parse_anytls(proxy_url)
+        if proxy_url.startswith("tuic://"):
+            return parse_tuic(proxy_url)
+        if proxy_url.startswith(("socks://", "socks5://", "socks5h://", "http://", "https://")):
+            return parse_mihomo_auth_uri(proxy_url)
+        if proxy_url.startswith("hysteria://"):
+            return parse_hysteria1(proxy_url)
+        if proxy_url.startswith("ssr://"):
+            return parse_ssr(proxy_url)
+        if proxy_url.startswith("mierus://"):
+            return parse_mierus(proxy_url)
     except Exception:
         return None
     return None
@@ -1676,9 +1892,14 @@ def canonical_proxy_key(proxy_url):
     # ponytail: canonical key on parsed dict (drops tag/fragment/query order),
     # fallback to fragment-stripped string for unsupported links
     try:
+        if isinstance(proxy_url, dict):
+            normalized = {k: v for k, v in proxy_url.items() if k not in ("name", "_native_mihomo", "_unsupported", "diagnostics")}
+            return "native:" + json.dumps(normalized, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
         parsed = parse_proxy_url(proxy_url)
         if parsed:
-            normalized = {k: v for k, v in parsed.items() if k != "tag"}
+            if parsed.get("protocol") == "unsupported":
+                raise ValueError
+            normalized = {k: v for k, v in parsed.items() if k not in ("tag", "diagnostics")}
             return "parsed:" + json.dumps(normalized, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     except Exception:
         pass
@@ -1760,13 +1981,50 @@ def _mihomo_network_opts(proxy_conf):
             data["grpc-opts"] = grpc_opts
         return data
 
-    # Нестандартные типы не отбрасываем: пробуем как обычный tcp
-    return {}
+    return None
+
+def protocol_capability(proxy_url):
+    """Single engine decision point for callers which can choose between cores."""
+    proxy = parse_proxy_url(proxy_url)
+    if not proxy:
+        return "unsupported"
+    if proxy.get("_native_mihomo"):
+        return "unsupported" if proxy.get("_unsupported") or str(proxy.get("type", "")).lower() not in MIHOMO_NATIVE_TYPES else "mihomo"
+    proto = proxy.get("protocol")
+    if proto in ("anytls", "tuic"):
+        return "mihomo"
+    if proto == "hysteria2":
+        return "unsupported" if proxy.get("realm") and proxy.get("lport") else ("mihomo" if proxy.get("realm") or proxy.get("insecure") or proxy.get("obfs") == "gecko" else "xray")
+    if proto in ("vless", "vmess", "trojan", "shadowsocks"):
+        if get_outbound_structure(proxy_url, "probe"):
+            return "xray"
+        return "mihomo" if get_mihomo_proxy_structure(proxy_url, "probe") else "unsupported"
+    return "unsupported"
+
+def mihomo_supports_shadowquic(core_path):
+    """Reject an explicitly-versioned Mihomo older than ShadowQUIC support."""
+    text = os.path.basename(str(core_path or ""))
+    if core_path and os.path.exists(core_path):
+        try:
+            result = subprocess.run([core_path, "-v"], capture_output=True, text=True, timeout=3)
+            text += result.stdout + result.stderr
+        except Exception:
+            pass
+    match = re.search(r"v?(\d+)\.(\d+)\.(\d+)", text)
+    return bool(match) and tuple(map(int, match.groups())) >= (1, 19, 29)
 
 def get_mihomo_proxy_structure(proxy_url, name):
     proxy_conf = parse_proxy_url(proxy_url)
     if not proxy_conf:
         return None
+    if proxy_conf.get("_native_mihomo"):
+        if proxy_conf.get("_unsupported") or str(proxy_conf.get("type", "")).lower() not in MIHOMO_NATIVE_TYPES:
+            return None
+        native = {k: copy.deepcopy(v) for k, v in proxy_conf.items() if k not in ("_native_mihomo", "_unsupported", "diagnostics")}
+        native["name"] = name
+        if native.get("type") == "shadowquic" and not mihomo_supports_shadowquic(CORE_PATH):
+            return None
+        return native
     if not proxy_conf.get("address"):
         return None
     if not is_valid_port(proxy_conf.get("port")):
@@ -1777,6 +2035,8 @@ def get_mihomo_proxy_structure(proxy_url, name):
         return None
 
     transport = _mihomo_network_opts(proxy_conf)
+    if transport is None:
+        return None
 
     base = {
         "name": name,
@@ -1808,7 +2068,7 @@ def get_mihomo_proxy_structure(proxy_url, name):
             "type": "trojan",
             "password": proxy_conf["uuid"],
             "tls": True,
-            "skip-cert-verify": True
+            "skip-cert-verify": False
         })
         if sni:
             base["servername"] = sni
@@ -1829,8 +2089,64 @@ def get_mihomo_proxy_structure(proxy_url, name):
             base["obfs"] = proxy_conf["obfs"]
             if proxy_conf.get("obfs_password"):
                 base["obfs-password"] = proxy_conf["obfs_password"]
+            if proxy_conf.get("obfs") == "gecko":
+                for key, target in (("obfs_min_packet_size", "obfs-min-packet-size"), ("obfs_max_packet_size", "obfs-max-packet-size")):
+                    if proxy_conf.get(key):
+                        base[target] = int(proxy_conf[key])
         if proxy_conf.get("alpn"):
             base["alpn"] = [a.strip() for a in str(proxy_conf["alpn"]).split(",") if a.strip()]
+        for key, target in (("fingerprint", "fingerprint"), ("ports", "ports"), ("hop_interval", "hop-interval"), ("up", "up"), ("down", "down")):
+            if proxy_conf.get(key):
+                base[target] = proxy_conf[key]
+        if proxy_conf.get("ech"):
+            base["ech-opts"] = {"enable": True, "config": proxy_conf["ech"]}
+        if proxy_conf.get("realm"):
+            if proxy_conf.get("lport"):
+                return None  # Mihomo has no lport field; do not silently drop it.
+            host = proxy_conf["address"]
+            if ":" in host:
+                host = f"[{host}]"
+            scheme = "http" if proxy_conf.get("realm_http") else "https"
+            base["realm-opts"] = {
+                "enable": True,
+                "server-url": f"{scheme}://{host}:{proxy_conf['port']}",
+                "token": proxy_conf["rendezvous"],
+                "realm-id": proxy_conf["realm"],
+            }
+            if proxy_conf.get("stun"):
+                base["realm-opts"]["stun-servers"] = proxy_conf["stun"]
+        return base
+
+    if proto == "anytls":
+        if not proxy_conf.get("uuid"):
+            return None
+        base.update({"type": "anytls", "password": proxy_conf["uuid"], "tls": True,
+                     "skip-cert-verify": bool(proxy_conf.get("insecure", False))})
+        if sni:
+            base["sni"] = sni
+        if proxy_conf.get("udp"):
+            base["udp"] = _bool_value(proxy_conf["udp"])
+        if proxy_conf.get("fingerprint"):
+            base["fingerprint"] = proxy_conf["fingerprint"]
+        if proxy_conf.get("ech"):
+            base["ech-opts"] = {"enable": True, "config": proxy_conf["ech"]}
+        return base
+
+    if proto == "tuic":
+        base.update({"type": "tuic", "udp-relay-mode": proxy_conf.get("udp_relay_mode") or "native"})
+        if proxy_conf.get("version") == 4:
+            base["token"] = proxy_conf["uuid"]
+        else:
+            base["uuid"] = proxy_conf["uuid"]
+            base["password"] = proxy_conf["password"]
+        if sni:
+            base["sni"] = sni
+        if proxy_conf.get("alpn"):
+            base["alpn"] = [x.strip() for x in proxy_conf["alpn"].split(",") if x.strip()]
+        if proxy_conf.get("congestion_controller"):
+            base["congestion-controller"] = proxy_conf["congestion_controller"]
+        if proxy_conf.get("disable_sni"):
+            base["disable-sni"] = _bool_value(proxy_conf["disable_sni"])
         return base
 
     if proto == "vmess":
@@ -1857,7 +2173,7 @@ def get_mihomo_proxy_structure(proxy_url, name):
 
     if security in ("tls", "reality", "xtls"):
         base["tls"] = True
-        base["skip-cert-verify"] = True
+        base["skip-cert-verify"] = False
         if sni:
             base["servername"] = sni
         fp = (proxy_conf.get("fp") or "").strip()
@@ -1873,8 +2189,6 @@ def get_mihomo_proxy_structure(proxy_url, name):
         sid = (proxy_conf.get("sid") or "").strip()
         if sid:
             reality_opts["short-id"] = sid
-        if _bool_value(proxy_conf.get("pcs")):
-            reality_opts["support-x25519mlkem768"] = True
         base["reality-opts"] = reality_opts
 
     base.update(transport or {})
@@ -1883,6 +2197,8 @@ def get_mihomo_proxy_structure(proxy_url, name):
 def get_proxy_tag(url):
     tag = "proxy"
     try:
+        if isinstance(url, dict):
+            return re.sub(r'[^\w\-\.]', '_', _first_scalar(url.get("name"), url.get("type", "proxy"))) or "proxy"
         url = clean_url(url)
         if '#' in url:
             _, raw_tag = url.rsplit('#', 1)
@@ -1909,189 +2225,92 @@ def is_valid_port(port):
     
 def get_outbound_structure(proxy_url, tag):
     try:
-        proxy_url = clean_url(proxy_url)
         proxy_conf = parse_proxy_url(proxy_url)
-        
-        if not proxy_conf or not proxy_conf.get("address"): return None
-        if not is_valid_port(proxy_conf.get("port")): return None
-        
-        if proxy_conf["protocol"] in ["vless", "vmess"]:
-            if not is_valid_uuid(proxy_conf.get("uuid")): return None
-        
-        net_type = proxy_conf.get("type", "tcp").lower()
-        header_type = proxy_conf.get("headerType", "").lower()
-        
-        if net_type == "http" or header_type == "http":
+        if not proxy_conf or not proxy_conf.get("address") or not is_valid_port(proxy_conf.get("port")):
             return None
-        
-        streamSettings = {}
-        security = proxy_conf.get("security", "none").lower()
-        
-        original_net_type = net_type
-        if net_type in ["ws", "websocket"]:
-            net_type = "xhttp"
-        elif net_type in ["grpc", "gun"]:
-            net_type = "xhttp"  
-        elif net_type in ["http", "h2"]:
-            net_type = "xhttp"
-        elif net_type == "httpupgrade":
-            net_type = "xhttp"
-        elif net_type not in ["tcp", "kcp", "quic", "xhttp"]:
-            net_type = "tcp"
-        
-        if proxy_conf["protocol"] in ["vless", "vmess", "trojan"]:
-            if security == "auto":
-                security = "none"
-            
-            streamSettings = {
-                "network": net_type,
-                "security": security
-            }
-            
-            alpn_val = None
-            raw_alpn = proxy_conf.get("alpn")
-            if raw_alpn:
-                if isinstance(raw_alpn, list): 
-                    alpn_val = raw_alpn
-                elif isinstance(raw_alpn, str): 
-                    alpn_val = raw_alpn.split(",")
-            
-            tls_settings = {
-                "serverName": proxy_conf.get("sni") or proxy_conf.get("host") or "",
-                "allowInsecure": True,
-                "fingerprint": proxy_conf.get("fp", "chrome")
-            }
-            
-            if alpn_val: 
-                tls_settings["alpn"] = alpn_val
-            
-            if security == "tls":
-                if proxy_conf.get("ech"):
-                    tls_settings["echConfigList"] = proxy_conf["ech"]
-                streamSettings["tlsSettings"] = tls_settings
-            elif security == "reality":
-                if not proxy_conf.get("pbk"): 
-                    return None
-                s_id = proxy_conf.get("sid", "")
-                if len(s_id) % 2 != 0: 
-                    s_id = ""
-                reality_settings = {
-                    "publicKey": proxy_conf.get("pbk"),
-                    "shortId": s_id,
-                    "serverName": tls_settings["serverName"],
-                    "fingerprint": tls_settings["fingerprint"],
-                    "spiderX": proxy_conf.get("spiderX") or "/"
-                }
-                if proxy_conf.get("pqv"):
-                    reality_settings["mldsa65Verify"] = proxy_conf["pqv"]
-                streamSettings["realitySettings"] = reality_settings
-            
-            path = proxy_conf.get("path") or "/"
-            host = proxy_conf.get("host") or ""
-            
-            if net_type == "xhttp":
-                mode = "auto"
-                if original_net_type in ["grpc", "gun"]:
-                    mode = "stream-up"
-                    if not path or path == "/":
-                        path = proxy_conf.get("serviceName") or "/"
-                
-                streamSettings["xhttpSettings"] = {
-                    "path": path,
-                    "host": host,
-                    "mode": mode
-                }
-            elif net_type == "tcp":
-                if proxy_conf.get("headerType") and proxy_conf.get("headerType").lower() != "none":
-                    return None
-            elif net_type == "kcp":
-                streamSettings["kcpSettings"] = {
-                    "header": {"type": proxy_conf.get("headerType") or "none"}
-                }
-            elif net_type == "quic":
-                streamSettings["quicSettings"] = {
-                    "security": proxy_conf.get("quicSecurity") or "none",
-                    "key": proxy_conf.get("key") or "",
-                    "header": {"type": proxy_conf.get("headerType") or "none"}
-                }
-        
-        outbound = {
-            "protocol": proxy_conf["protocol"],
-            "tag": tag,
-            "streamSettings": streamSettings
-        }
-        
-        if proxy_conf["protocol"] == "shadowsocks":
+        proto = proxy_conf["protocol"]
+        if proto in ("anytls", "tuic") or (proto == "hysteria2" and (proxy_conf.get("realm") or proxy_conf.get("insecure") or proxy_conf.get("obfs") == "gecko")):
+            return None
+        if proto in ("vless", "vmess") and not is_valid_uuid(proxy_conf.get("uuid")):
+            return None
+        if proto == "shadowsocks":
             method = _normalize_ss_method(proxy_conf.get("method"))
             if method not in SS_XRAY_ALLOWED_METHODS:
-                if GLOBAL_CFG.get("debug_mode"):
-                    safe_print(f"[yellow][DEBUG] Skipping SS link for Xray: unsupported cipher '{method}'[/]")
                 return None
-            outbound["settings"] = {
-                "servers": [{
-                    "address": proxy_conf["address"],
-                    "port": int(proxy_conf["port"]),
-                    "method": method,
-                    "password": proxy_conf["password"]
-                }]
-            }
-            outbound.pop("streamSettings", None)
-            
-        elif proxy_conf["protocol"] == "trojan":
-            outbound["settings"] = {
-                "servers": [{
-                    "address": proxy_conf["address"],
-                    "port": int(proxy_conf["port"]),
-                    "password": proxy_conf["uuid"]
-                }]
-            }
-            
-        elif proxy_conf["protocol"] == "hysteria2":
-            hy2_settings = {
-                "address": proxy_conf["address"],
-                "port": int(proxy_conf["port"]),
-                "users": [{"password": proxy_conf["uuid"]}]
-            }
-            if proxy_conf.get("obfs") and proxy_conf.get("obfs") != "none":
-                hy2_settings["obfs"] = {
-                    "type": proxy_conf["obfs"],
-                    "password": proxy_conf.get("obfs_password", "")
-                }
-            outbound["settings"] = {"vnext": [hy2_settings]}
-            hy2_tls = {
-                "serverName": proxy_conf.get("sni", ""),
-                "allowInsecure": True,
-                "fingerprint": "chrome"
-            }
-            raw_alpn = proxy_conf.get("alpn", "")
-            if raw_alpn:
-                alpn_list = raw_alpn if isinstance(raw_alpn, list) else [a.strip() for a in str(raw_alpn).split(",") if a.strip()]
-                if alpn_list:
-                    hy2_tls["alpn"] = alpn_list
-            outbound["streamSettings"] = {
-                "security": "tls",
-                "tlsSettings": hy2_tls
-            }
+            return {"protocol": "shadowsocks", "tag": tag, "settings": {"address": proxy_conf["address"], "port": int(proxy_conf["port"]), "method": method, "password": proxy_conf["password"], "uot": False, "uotVersion": 0}}
+        if proto == "hysteria2":
+            if not proxy_conf.get("uuid"):
+                return None
+            tls = {"serverName": proxy_conf.get("sni") or proxy_conf["address"]}
+            if proxy_conf.get("alpn"):
+                tls["alpn"] = [x.strip() for x in proxy_conf["alpn"].split(",") if x.strip()]
+            if proxy_conf.get("ech"):
+                tls["echConfigList"] = proxy_conf["ech"]
+            settings = {"version": 2, "address": proxy_conf["address"], "port": int(proxy_conf["port"])}
+            hysteria = {"version": 2, "auth": proxy_conf["uuid"]}
+            stream = {"network": "hysteria", "security": "tls", "tlsSettings": tls, "hysteriaSettings": hysteria}
+            finalmask = {}
+            if proxy_conf.get("obfs") == "salamander":
+                finalmask["udp"] = [{"type": "salamander", "settings": {"password": proxy_conf.get("obfs_password", "")}}]
+            quic = {}
+            if proxy_conf.get("ports"):
+                quic["udpHop"] = {"ports": proxy_conf["ports"], "interval": proxy_conf.get("hop_interval") or 30}
+            if proxy_conf.get("up"):
+                quic["brutalUp"] = proxy_conf["up"]
+            if proxy_conf.get("down"):
+                quic["brutalDown"] = proxy_conf["down"]
+            if quic:
+                finalmask["quicParams"] = quic
+            if finalmask:
+                stream["finalmask"] = finalmask
+            return {"protocol": "hysteria", "tag": tag, "settings": settings, "streamSettings": stream}
+        security = (proxy_conf.get("security") or "none").lower()
+        network = proxy_conf.get("type") or "raw"
+        network = {
+            "tcp": "raw", "splithttp": "xhttp", "mkcp": "kcp",
+            "websocket": "ws", "gun": "grpc",
+        }.get(network, network)
+        if network in ("http", "h2", "h3", "quic") or (security == "reality" and network not in ("raw", "xhttp", "grpc")):
+            return None
+        stream = {"network": network, "security": "none" if security == "auto" else security}
+        tls = {"serverName": proxy_conf.get("sni") or proxy_conf.get("host") or proxy_conf["address"], "fingerprint": proxy_conf.get("fp") or "chrome"}
+        if proxy_conf.get("alpn"):
+            tls["alpn"] = [x.strip() for x in proxy_conf["alpn"].split(",") if x.strip()]
+        if proxy_conf.get("pcs"):
+            tls["pinnedPeerCertSha256"] = proxy_conf["pcs"].split(",")
+        if proxy_conf.get("vcn"):
+            tls["verifyPeerCertByName"] = proxy_conf["vcn"]
+        if security == "tls":
+            if proxy_conf.get("ech"): tls["echConfigList"] = proxy_conf["ech"]
+            stream["tlsSettings"] = tls
+        elif security == "reality":
+            if not proxy_conf.get("pbk"): return None
+            reality = {"password": proxy_conf["pbk"], "shortId": proxy_conf.get("sid", ""), "serverName": tls["serverName"], "fingerprint": tls["fingerprint"], "spiderX": proxy_conf.get("spiderX") or "/"}
+            if proxy_conf.get("pqv"): reality["mldsa65Verify"] = proxy_conf["pqv"]
+            stream["realitySettings"] = reality
+        if network == "xhttp":
+            stream["xhttpSettings"] = {"path": proxy_conf.get("path") or "/", "host": proxy_conf.get("host") or "", "mode": proxy_conf.get("mode") or "auto"}
+            if proxy_conf.get("extra") is not None: stream["xhttpSettings"]["extra"] = proxy_conf["extra"]
+        elif network == "grpc":
+            stream["grpcSettings"] = {"serviceName": proxy_conf.get("serviceName") or (proxy_conf.get("path") or "/").strip("/")}
+        elif network in ("ws", "httpupgrade"):
+            key = "httpupgradeSettings" if network == "httpupgrade" else "wsSettings"
+            stream[key] = {"path": proxy_conf.get("path") or "/", "host": proxy_conf.get("host") or ""}
+        elif network == "kcp":
+            if proxy_conf.get("headerType") not in ("", "none") and proxy_conf.get("fm") is None:
+                return None
+        if proxy_conf.get("fm") is not None: stream["finalmask"] = proxy_conf["fm"]
+        base = {"address": proxy_conf["address"], "port": int(proxy_conf["port"]), "level": 0}
+        if proto == "vless":
+            base.update({"id": proxy_conf["uuid"], "encryption": proxy_conf.get("encryption") or "none", "flow": proxy_conf.get("flow") or ""})
+        elif proto == "vmess":
+            base.update({"id": proxy_conf["uuid"], "security": proxy_conf.get("scy") or "auto", "experiments": ""})
+        elif proto == "trojan":
+            base.update({"password": proxy_conf.get("uuid"), "flow": proxy_conf.get("flow") or ""})
         else:
-            vnext_user = {
-                "id": proxy_conf["uuid"],
-                "alterId": proxy_conf.get("aid", 0),
-                "encryption": (proxy_conf.get("encryption") or "none") if proxy_conf["protocol"] == "vless" else "none"
-            }
-            if proxy_conf["protocol"] == "vless" and proxy_conf.get("flow"):
-                vnext_user["flow"] = proxy_conf.get("flow")
-            
-            outbound["settings"] = {
-                "vnext": [{
-                    "address": proxy_conf["address"],
-                    "port": int(proxy_conf["port"]),
-                    "users": [vnext_user]
-                }]
-            }
-        
-        return outbound
-        
-    except Exception as e:
+            return None
+        return {"protocol": proto, "tag": tag, "settings": base, "streamSettings": stream}
+    except Exception:
         return None
 
 def create_batch_config_file(proxy_list, start_port, work_dir):
@@ -2309,7 +2528,12 @@ def drop_proxy_by_outbound_tag(active_proxy_list, valid_mapping, out_tag):
             break
     if dropped_url is None:
         return list(active_proxy_list), None
-    new_list = [u for u in active_proxy_list if u != dropped_url]
+    new_list, removed = [], False
+    for item in active_proxy_list:
+        if not removed and item == dropped_url:
+            removed = True
+            continue
+        new_list.append(item)
     return new_list, dropped_url
 
 def check_connection(local_port, domain, timeout):
@@ -2624,7 +2848,7 @@ def Checker_mihomo(proxyList, localPortStart, testDomain, timeOut, t2exec, t2kil
             continue
 
         conf = parse_proxy_url(target_url)
-        addr_info = f"{conf['address']}:{conf['port']}" if conf else "unknown"
+        addr_info = f"{(conf.get('address') or conf.get('server', 'unknown'))}:{conf.get('port', '')}" if conf else "unknown"
         proxy_tag = get_proxy_tag(target_url)
 
         proxy_speed = 0.0
@@ -3278,7 +3502,7 @@ def run_logic(args):
             safe_print(f"[dim]>> Пропущено чужих процессов: {skipped_foreign}[/]")
     time.sleep(0.5)
     
-    lines = set()
+    lines = {}
     total_found_raw = 0
     
     if args.file:
@@ -3289,7 +3513,7 @@ def run_logic(args):
                 file_payload = f.read()
                 parsed, count = parse_content(file_payload)
                 total_found_raw += count
-                lines.update(parsed)
+                _merge_proxy_entries(lines, parsed)
                 safe_print(f"[dim]>> Прямых ссылок в файле: {len(parsed)}[/]")
 
                 sub_urls = extract_subscription_urls(file_payload)
@@ -3300,7 +3524,7 @@ def run_logic(args):
                     for sub_url in sub_urls:
                         links = fetch_url(sub_url)
                         fetched_sub_total += len(links)
-                        lines.update(links)
+                        _merge_proxy_entries(lines, links)
                     added_unique = len(lines) - before_sub_merge
                     safe_print(
                         f"[dim]>> Из подписок получено: {fetched_sub_total}, "
@@ -3309,7 +3533,7 @@ def run_logic(args):
 
     if args.url:
         links = fetch_url(args.url)
-        lines.update(links)
+        _merge_proxy_entries(lines, links)
 
     if AGGREGATOR_AVAILABLE and getattr(args, 'agg', False):
         sources_map = GLOBAL_CFG.get("sources", {})
@@ -3330,19 +3554,19 @@ def run_logic(args):
                 log_func=safe_print,
                 console=console
             )
-            lines.update(agg_links)
+            _merge_proxy_entries(lines, agg_links)
         except: pass
 
     if hasattr(args, 'direct_list') and args.direct_list:
         parsed_agg, _ = parse_content("\n".join(args.direct_list))
-        lines.update(parsed_agg)
+        _merge_proxy_entries(lines, parsed_agg)
 
     if args.reuse and os.path.exists(args.output):
         with open(args.output, 'r', encoding='utf-8') as f:
             parsed, count = parse_content(f.read())
-            lines.update(parsed)
+            _merge_proxy_entries(lines, parsed)
 
-    full = sorted(lines)
+    full = list(lines.values())
     if args.shuffle:
         random.shuffle(full)
     safe_print(f"[dim]>> Уникальных прокси к проверке: {len(full)}[/]")
@@ -3350,13 +3574,20 @@ def run_logic(args):
         safe_print(f"[bold red]Нет прокси для проверки.[/]")
         return
 
-    has_hysteria2 = any("hysteria2://" in p.lower() or "hy2://" in p.lower() for p in full)
-    
-    xray_list = full
+    xray_list = []
     mihomo_list = []
-    mihomo_path = ""
-    
-    if has_hysteria2 and CORE_FLAVOR != "mihomo":
+    mihomo_path = CORE_PATH if CORE_FLAVOR == "mihomo" else ""
+    needs_mihomo = [p for p in full if protocol_capability(p) == "mihomo"]
+    unsupported = [p for p in full if protocol_capability(p) == "unsupported"]
+    for p in full:
+        parsed = parse_proxy_url(p) or {}
+        for diagnostic in parsed.get("diagnostics", []):
+            safe_print(f"[yellow]{get_proxy_tag(p)}: {diagnostic}[/]")
+    for p in unsupported:
+        safe_print(f"[yellow]Unsupported proxy skipped: {get_proxy_tag(p)}[/]")
+    if CORE_FLAVOR == "mihomo":
+        mihomo_list = [p for p in full if p not in unsupported]
+    elif needs_mihomo:
         candidates = build_core_candidates("mihomo")
         for c in candidates:
             resolved = shutil.which(c)
@@ -3368,17 +3599,16 @@ def run_logic(args):
                 break
         
         if mihomo_path:
-            xray_list = []
             for p in full:
-                if "hysteria2://" in p.lower() or "hy2://" in p.lower():
+                if protocol_capability(p) == "mihomo":
                     mihomo_list.append(p)
-                else:
+                elif protocol_capability(p) == "xray":
                     xray_list.append(p)
         else:
-            safe_print("\n[bold yellow]⚠ ВНИМАНИЕ: В списке для проверки найдены ссылки Hysteria2![/]")
-            safe_print("[bold yellow]Ядро Xray не поддерживает протокол Hysteria2, проверка этих ссылок выдаст 0 (ошибку).[/]")
-            safe_print("[bold yellow]Установите mihomo для автоматической проверки hy2.[/]\n")
-            time.sleep(3)
+            safe_print("[yellow]Mihomo-required proxies skipped: core not found.[/]")
+            xray_list = [p for p in full if protocol_capability(p) == "xray"]
+    else:
+        xray_list = [p for p in full if protocol_capability(p) == "xray"]
 
     results = []
     
@@ -3482,7 +3712,9 @@ def run_logic(args):
     
     with open(args.output, 'w', encoding='utf-8') as f:
         for r in results:
-            f.write(r[0] + '\n')
+            value = ({k: v for k, v in r[0].items() if k != "_native_mihomo"}
+                     if isinstance(r[0], dict) else r[0])
+            f.write((json.dumps(value, ensure_ascii=False) if isinstance(value, dict) else value) + '\n')
 
     if results:
         table = Table(title=f"Результаты (Топ 15 из {len(results)})", box=box.ROUNDED)
