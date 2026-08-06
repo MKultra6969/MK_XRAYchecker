@@ -19,7 +19,7 @@
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
 # +═════════════════════════════════════════════════════════════════════════+
-# ║                           VERSION 1.8.0                                 ║
+# ║                           VERSION 1.8.1                                 ║
 # ║             В случае багов/недочётов создайте issue на github           ║
 # ║                                                                         ║
 # +═════════════════════════════════════════════════════════════════════════+
@@ -61,7 +61,7 @@ YAML_WARNED = False
 
 # ВЕРСИЯ СКРИПТА
 # Формат: MAJOR.MINOR.PATCH (SemVer)
-__version__ = "1.8.0"
+__version__ = "1.8.1"
 
 
 def _ensure_utf8_stdio():
@@ -3185,7 +3185,10 @@ def run_mtproto_logic(args):
         )
         console.print(f"[dim]Telegram DC order: {dc_desc}[/]")
     if runtime_cfg.get("max_ping_ms", 0) > 0:
-        console.print(f"[dim]Фильтр ping Telegram proxy: <= {runtime_cfg['max_ping_ms']} ms[/]")
+        console.print(
+            f"[dim]Фильтр ping Telegram proxy: TCP RTT <= {runtime_cfg['max_ping_ms']} ms "
+            f"(время MTProto handshake не фильтруется)[/]"
+        )
 
     mtproto_log_buffer = []
     with Progress(*progress_columns, console=console, transient=False) as progress:
@@ -3307,7 +3310,7 @@ def run_mtproto_logic(args):
     )
     if runtime_cfg.get("max_ping_ms", 0) > 0 and drop_count > 0:
         safe_print(
-            f"[yellow]Подсказка:[/] {drop_count} Telegram proxy живы, но отфильтрованы по ping > "
+            f"[yellow]Подсказка:[/] {drop_count} Telegram proxy живы, но отфильтрованы по TCP RTT > "
             f"{runtime_cfg['max_ping_ms']} ms. Для проверки именно живых прокси поставь `Telegram proxy ping = 0`."
         )
 

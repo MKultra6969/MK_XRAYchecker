@@ -2,6 +2,18 @@
 
 Почти все изменения проекта будут документироваться в этом файле.
 
+## [1.8.1] - 2026-08-06
+
+### Fixed
+- MTProto checker больше не выбрасывает живые Telegram proxy в `DROP`: `ping_ms` для MTProto — это полное время установки сессии (FakeTLS handshake + генерация auth_key + `help.getConfig`), то есть штатные 3-8 секунд, и сравнивать его с дефолтным `max_ping_ms = 666` было бессмысленно. Теперь `max_ping_ms` фильтрует по чистому TCP RTT до прокси (`tcp_ping_ms`), а handshake остаётся только для отображения и сортировки.
+- Для `ee`-секретов (FakeTLS) первым теперь пробуется `faketls-randomized` — единственный packet codec, который принимает настоящий MTProxy; `faketls-abridged` и `faketls-intermediate` оставлены фолбэком для форков. Раньше живой прокси сжигал `(connect_retries + 1) * 2` заведомо мёртвых коннекта на каждый DC перед рабочим транспортом (~18 с при `probe_policy = telegram_like`).
+- Настоящая ошибка транспорта больше не теряется: Telethon глотает исключение в `MTProtoSender._try_connect` и отдаёт generic `Connection to Telegram failed N time(s)`. Теперь checker перехватывает исходное исключение и показывает причину (`FakeTLS server hello verification failed`, `Unexpected first TLS record type`, `Proxy closed the connection after sending initial payload` и т.д.).
+
+### Changed
+- В live-логе MTProto рядом с временем handshake выводится TCP RTT: `[LIVE] 62.84.121.63:8443 | 4182ms (tcp 1ms)`.
+- `tcp_ping_ms` добавлен в sidecar-диагностику `sortedMtproto.attempts.json` и `sortedMtproto.promo.json`.
+- Подсказки о фильтре ping в MTProto-режиме уточнены: фильтруется TCP RTT, а не время MTProto handshake.
+
 ## [1.8.0] - 2026-07-24
 
 ### Added

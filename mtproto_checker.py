@@ -21,7 +21,7 @@ from threading import Lock
 
 import requests
 
-__version__ = "1.6.1"
+__version__ = "1.6.2"
 ALLOWED_CRYPTO_BACKENDS = {"auto", "safe", "unsafe"}
 ALLOWED_PROBE_POLICIES = {"strict", "balanced", "telegram_like"}
 PROBE_POLICY_DEFAULTS = {
@@ -102,8 +102,18 @@ _SUCCESSFUL_CONFIG_DC_LOCK = Lock()
 
 class MTProtoSenderConnectError(ConnectionError):
     def __init__(self, original, connection_instance=None):
-        super().__init__(str(original) or original.__class__.__name__)
+        # Telethon's MTProtoSender swallows the real transport failure into a
+        # logger warning and re-raises a generic "Connection to Telegram failed
+        # N time(s)". Recover the original cause recorded by the instrumented
+        # connection so the checker can report something actionable.
+        transport_error = getattr(connection_instance, "last_transport_error", None)
+        if transport_error is not None:
+            message = f"{transport_error.__class__.__name__}: {transport_error}"
+        else:
+            message = str(original) or original.__class__.__name__
+        super().__init__(message)
         self.original = original
+        self.transport_error = transport_error
         self.transport_handshake_completed = bool(
             getattr(connection_instance, "fake_tls_server_hello_verified", False)
             or getattr(connection_instance, "mtproxy_initial_payload_sent", False)
@@ -954,10 +964,15 @@ def _build_connection_candidates(entry):
     if secret_mode == "ee":
         if not FAKETLS_AVAILABLE or not ConnectionTcpMTProxyFakeTLS:
             return []
+        # Real MTProxy FakeTLS servers only speak padded (randomized)
+        # intermediate; abridged/intermediate are rejected right after the
+        # initial payload. Try the working codec first and keep the other two
+        # as a fallback for forks, otherwise every live ee-proxy burns
+        # (connect_retries + 1) * 2 doomed connections before succeeding.
         return [
+            ("faketls-randomized", ConnectionTcpMTProxyFakeTLS),
             ("faketls-abridged", ConnectionTcpMTProxyFakeTLSAbridged),
             ("faketls-intermediate", ConnectionTcpMTProxyFakeTLSIntermediate),
-            ("faketls-randomized", ConnectionTcpMTProxyFakeTLS),
         ]
     if secret_mode == "dd":
         return [("randomized", connection.ConnectionTcpMTProxyRandomizedIntermediate)]
@@ -1032,17 +1047,19 @@ def _get_probe_connect_timeout(entry, runtime_cfg):
 
 
 async def _probe_proxy_reachability(entry, timeout):
+    """Return (error, tcp_ping_ms). tcp_ping_ms is the pure TCP RTT to the proxy."""
     writer = None
+    started = time.perf_counter()
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host=entry["server"], port=int(entry["port"])),
             timeout=timeout,
         )
-        return None
+        return None, round((time.perf_counter() - started) * 1000)
     except asyncio.TimeoutError:
-        return f"Proxy TCP connect timed out after {int(timeout)}s"
+        return f"Proxy TCP connect timed out after {int(timeout)}s", None
     except OSError as exc:
-        return f"Proxy TCP connect failed: {_format_probe_error(exc)}"
+        return f"Proxy TCP connect failed: {_format_probe_error(exc)}", None
     finally:
         if writer is not None:
             try:
@@ -1052,6 +1069,23 @@ async def _probe_proxy_reachability(entry, timeout):
                     await asyncio.wait_for(wait_closed(), timeout=1)
             except Exception:
                 pass
+
+
+def _instrument_connection_errors(connection_instance):
+    """Record the transport-level exception that MTProtoSender._try_connect eats."""
+    original_connect = connection_instance.connect
+    connection_instance.last_transport_error = None
+
+    async def connect(*args, **kwargs):
+        try:
+            return await original_connect(*args, **kwargs)
+        except BaseException as exc:
+            if not _should_reraise_base_exception(exc):
+                connection_instance.last_transport_error = exc
+            raise
+
+    connection_instance.connect = connect
+    return connection_instance
 
 
 async def _connect_sender_only(client, timeout, dc_candidate=None):
@@ -1082,6 +1116,7 @@ async def _connect_sender_only(client, timeout, dc_candidate=None):
         proxy=client._proxy,
         local_addr=client._local_addr,
     )
+    _instrument_connection_errors(connection_instance)
     try:
         await asyncio.wait_for(client._sender.connect(connection_instance), timeout=timeout)
     except BaseException as exc:
@@ -1660,6 +1695,7 @@ async def _probe_mtproto_async(entry, runtime_cfg):
         return {
             "entry": entry,
             "ping_ms": None,
+            "tcp_ping_ms": None,
             "status": "fail",
             "error": (
                 "FakeTLS backend unavailable"
@@ -1668,11 +1704,12 @@ async def _probe_mtproto_async(entry, runtime_cfg):
             "attempts": attempts,
         }
 
-    proxy_error = await _probe_proxy_reachability(entry, proxy_reachability_timeout)
+    proxy_error, tcp_ping_ms = await _probe_proxy_reachability(entry, proxy_reachability_timeout)
     if proxy_error:
         return {
             "entry": entry,
             "ping_ms": None,
+            "tcp_ping_ms": None,
             "status": "proxy_unreachable",
             "error": proxy_error,
             "attempts": attempts,
@@ -1751,6 +1788,7 @@ async def _probe_mtproto_async(entry, runtime_cfg):
                                     return {
                                         "entry": entry,
                                         "ping_ms": elapsed_ms,
+                                        "tcp_ping_ms": tcp_ping_ms,
                                         "status": "live",
                                         "error": None,
                                         "transport": transport_name,
@@ -1886,13 +1924,16 @@ async def _probe_mtproto_async(entry, runtime_cfg):
                                 last_error = f"dc{dc_id}/{transport_name}: disconnect failed: {disconnect_error}"
 
     if best_connect_only is not None:
+        best_connect_only["tcp_ping_ms"] = tcp_ping_ms
         return best_connect_only
     if best_soft_fail is not None:
+        best_soft_fail["tcp_ping_ms"] = tcp_ping_ms
         return best_soft_fail
 
     return {
         "entry": entry,
         "ping_ms": None,
+        "tcp_ping_ms": tcp_ping_ms,
         "status": "fail",
         "error": last_error,
         "attempts": attempts,
@@ -1969,6 +2010,13 @@ def run_mtproto_check(entries, runtime_cfg, log_func=None, progress_callback=Non
             ping_ms = result["ping_ms"]
             error_reason = result["error"]
             proxy_kind = str(entry.get("proxy_kind") or "mtproto").lower()
+            # ping_ms is the full session handshake (transport + auth key DH +
+            # RPC) and is normally 3-8s even for a healthy proxy, so it is not
+            # comparable to the Xray latency budget. Filter on the plain TCP RTT
+            # to the proxy instead, and fall back to the handshake only when the
+            # RTT is unknown.
+            tcp_ping_ms = result.get("tcp_ping_ms")
+            filter_ping_ms = tcp_ping_ms if tcp_ping_ms is not None else ping_ms
 
             if ping_ms is not None:
                 if result.get("status") == "connect_only":
@@ -1983,20 +2031,22 @@ def run_mtproto_check(entries, runtime_cfg, log_func=None, progress_callback=Non
                             f"[magenta][SOFT][/] [white]{label:<25}[/] | "
                             f"{ping_ms:>4}ms | {error_reason or 'Soft probe failure'} | {proxy_kind}"
                         )
-                elif max_ping_ms and ping_ms > max_ping_ms:
+                elif max_ping_ms and filter_ping_ms > max_ping_ms:
                     result["status"] = "drop"
                     if log_func:
                         log_func(
                             f"[yellow][DROP][/] [white]{label:<25}[/] | "
-                            f"{ping_ms:>4}ms > {max_ping_ms}ms | {proxy_kind}"
+                            f"{filter_ping_ms:>4}ms > {max_ping_ms}ms | "
+                            f"handshake {ping_ms}ms | {proxy_kind}"
                         )
                 else:
                     result["status"] = "live"
                     probe_suffix = f" | {result.get('probe_name')}" if result.get("probe_name") else ""
+                    tcp_suffix = f" (tcp {tcp_ping_ms}ms)" if tcp_ping_ms is not None else ""
                     if log_func:
                         log_func(
                             f"[green][LIVE][/] [white]{label:<25}[/] | "
-                            f"{ping_ms:>4}ms | {proxy_kind}{probe_suffix}"
+                            f"{ping_ms:>4}ms{tcp_suffix} | {proxy_kind}{probe_suffix}"
                         )
                     current_live_results.append((entry.get("canonical_url", entry["original_url"]), ping_ms, 0.0))
             else:
@@ -2033,6 +2083,7 @@ def write_attempt_diagnostics(path, all_results):
         payload.append({
             "status": result.get("status"),
             "ping_ms": result.get("ping_ms"),
+            "tcp_ping_ms": result.get("tcp_ping_ms"),
             "error": result.get("error"),
             "transport": result.get("transport"),
             "dc_id": result.get("dc_id"),
@@ -2083,6 +2134,7 @@ def write_promo_diagnostics(path, all_results):
         payload.append({
             "status": result.get("status"),
             "ping_ms": result.get("ping_ms"),
+            "tcp_ping_ms": result.get("tcp_ping_ms"),
             "transport": result.get("transport"),
             "dc_id": result.get("dc_id"),
             "probe_name": result.get("probe_name"),
