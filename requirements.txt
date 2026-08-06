@@ -4,6 +4,6 @@ pysocks
 rich
 art
 pyyaml
-telethon
+telethon>=1.44.0
 urllib3
 colorama

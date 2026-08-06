@@ -13,6 +13,7 @@
 - В live-логе MTProto рядом с временем handshake выводится TCP RTT: `[LIVE] 62.84.121.63:8443 | 4182ms (tcp 1ms)`.
 - `tcp_ping_ms` добавлен в sidecar-диагностику `sortedMtproto.attempts.json` и `sortedMtproto.promo.json`.
 - Подсказки о фильтре ping в MTProto-режиме уточнены: фильтруется TCP RTT, а не время MTProto handshake.
+- В `requirements.txt` для Telethon задан минимум `>=1.44.0`. Telethon 1.43+ мигрирует `mtproto_promo.session` со схемы v7 на v8 (колонка `tmp_auth_key`) прямо при открытии, и старый Telethon после этого падает с `ValueError: too many values to unpack (expected 5)`. Без нижней границы `pip install -r requirements.txt` не обновлял уже установленный старый Telethon.
 
 ## [1.8.0] - 2026-07-24
 
