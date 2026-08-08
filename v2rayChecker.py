@@ -19,7 +19,7 @@
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
 # +═════════════════════════════════════════════════════════════════════════+
-# ║                           VERSION 1.8.1                                 ║
+# ║                           VERSION 1.9.0                                 ║
 # ║             В случае багов/недочётов создайте issue на github           ║
 # ║                                                                         ║
 # +═════════════════════════════════════════════════════════════════════════+
@@ -61,7 +61,7 @@ YAML_WARNED = False
 
 # ВЕРСИЯ СКРИПТА
 # Формат: MAJOR.MINOR.PATCH (SemVer)
-__version__ = "1.8.1"
+__version__ = "1.9.0"
 
 
 def _ensure_utf8_stdio():
@@ -346,6 +346,25 @@ DEFAULT_CONFIG = {
     # autoinstall_mihomo: True = автоматически скачать и установить mihomo если не найден
     "autoinstall_mihomo": True,
 
+    # АВТООБНОВЛЕНИЕ ЯДЕР (Telethon / Xray / Mihomo)
+    # Работает только для уже установленных ядер: первичная установка
+    # по-прежнему за autoinstall_xray / autoinstall_mihomo.
+    "core_autoupdate": {
+        # Мастер-выключатель проверки обновлений ядер на старте
+        "enabled": True,
+        # True = обновлять без вопросов, False = спрашивать подтверждение
+        "auto_apply": True,
+        # Как часто проверять (часы). 0 = проверять каждый запуск
+        "check_interval_hours": 24,
+        # Тумблеры по каждому ядру
+        "telethon": True,
+        "xray": True,
+        "mihomo": True,
+        # Строгая верхняя граница версии Telethon (2.x = несовместимый rewrite).
+        # Пустая строка снимает ограничение.
+        "telethon_max_version": "2.0.0"
+    },
+
     # Максимальный ping (мс) для отсева. 0 = не фильтровать по ping.
     "max_ping_ms": 666,
 
@@ -415,6 +434,14 @@ def get_mtproto_config(cfg=None):
     source = cfg if isinstance(cfg, dict) else GLOBAL_CFG
     base = copy.deepcopy(DEFAULT_CONFIG.get("mtproto", {}))
     user_value = source.get("mtproto", {}) if isinstance(source, dict) else {}
+    merged, _ = _merge_with_defaults(base, user_value)
+    return merged
+
+
+def get_core_autoupdate_config(cfg=None):
+    source = cfg if isinstance(cfg, dict) else GLOBAL_CFG
+    base = copy.deepcopy(DEFAULT_CONFIG.get("core_autoupdate", {}))
+    user_value = source.get("core_autoupdate", {}) if isinstance(source, dict) else {}
     merged, _ = _merge_with_defaults(base, user_value)
     return merged
 
@@ -3827,6 +3854,200 @@ def kill_all_cores_manual():
     else:
         safe_print("[bold green]✅ Все чисто![/]")
 
+CORE_LABELS = {"telethon": "Telethon", "xray": "Xray", "mihomo": "Mihomo"}
+
+
+def _format_core_autoupdate_status():
+    cu_cfg = get_core_autoupdate_config(GLOBAL_CFG)
+    if not _bool_value(cu_cfg.get("enabled", True), True):
+        return "OFF"
+
+    mode = "auto" if _bool_value(cu_cfg.get("auto_apply", True), True) else "ask"
+    enabled_cores = [
+        CORE_LABELS[core] for core in ("telethon", "xray", "mihomo")
+        if _bool_value(cu_cfg.get(core, True), True)
+    ]
+    cores_text = "/".join(enabled_cores) if enabled_cores else "нет ядер"
+
+    try:
+        interval = int(cu_cfg.get("check_interval_hours", 24))
+    except (TypeError, ValueError):
+        interval = 24
+    interval_text = "каждый запуск" if interval <= 0 else f"раз в {interval} ч"
+
+    return f"ON ({mode}) | {cores_text} | {interval_text}"
+
+
+def _save_core_autoupdate(cu_cfg, message):
+    GLOBAL_CFG["core_autoupdate"] = cu_cfg
+    ok, err = save_main_config(GLOBAL_CFG)
+    if ok:
+        safe_print(f"[green]✓ {message}[/]")
+    else:
+        safe_print(f"[yellow]Не удалось сохранить конфиг: {err}[/]")
+    time.sleep(1.0)
+
+
+def _render_core_versions_table(statuses):
+    table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED, expand=True, title="Версии ядер")
+    table.add_column("Ядро", style="cyan", width=12)
+    table.add_column("Установлено", style="white", width=16)
+    table.add_column("Доступно", style="white", width=16)
+    table.add_column("Статус", style="dim", ratio=3)
+
+    for status in statuses:
+        core = status.get("core", "?")
+        installed = status.get("installed") or "-"
+        latest = status.get("latest") or "-"
+
+        if status.get("error"):
+            state = f"[yellow]{status['error']}[/]"
+        elif status.get("needs_update"):
+            state = "[bold yellow]доступно обновление[/]"
+        else:
+            state = "[green]актуально[/]"
+
+        table.add_row(CORE_LABELS.get(core, core), str(installed), str(latest), state)
+
+    console.print(table)
+
+
+def _handle_core_update_summary(summary):
+    """Перезапускает скрипт, если обновлённый Telethon уже импортирован в текущий процесс."""
+    if not summary or not summary.get("restart_required"):
+        return
+
+    if os.environ.get("MKXRAY_CORE_UPDATE_RESTARTED") == "1":
+        safe_print("[yellow]Telethon обновлён. Изменения применятся после ручного перезапуска.[/]")
+        return
+
+    safe_print("[bold green]Telethon обновлён. Перезапуск скрипта...[/]")
+    os.environ["MKXRAY_CORE_UPDATE_RESTARTED"] = "1"
+    try:
+        time.sleep(1)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        safe_print(f"[yellow]Не удалось перезапуститься автоматически: {e}[/]")
+        safe_print("[bold]Перезапустите скрипт вручную, чтобы новая версия Telethon применилась.[/]")
+
+
+def core_autoupdate_menu():
+    while True:
+        cu_cfg = get_core_autoupdate_config(GLOBAL_CFG)
+        enabled = _bool_value(cu_cfg.get("enabled", True), True)
+        auto_apply = _bool_value(cu_cfg.get("auto_apply", True), True)
+
+        try:
+            interval = int(cu_cfg.get("check_interval_hours", 24))
+        except (TypeError, ValueError):
+            interval = 24
+
+        max_version = str(cu_cfg.get("telethon_max_version", "") or "").strip()
+
+        rows = [
+            ("1", "Автообновление", "ON — проверять ядра на старте" if enabled else "OFF — не проверять"),
+            ("2", "Режим применения", "auto — без вопросов" if auto_apply else "ask — спрашивать подтверждение"),
+            ("3", "Telethon", "ON" if _bool_value(cu_cfg.get("telethon", True), True) else "OFF"),
+            ("4", "Xray", "ON" if _bool_value(cu_cfg.get("xray", True), True) else "OFF"),
+            ("5", "Mihomo", "ON" if _bool_value(cu_cfg.get("mihomo", True), True) else "OFF"),
+            ("6", "Интервал проверки", "каждый запуск" if interval <= 0 else f"{interval} ч"),
+            ("7", "Потолок Telethon", max_version or "без ограничения"),
+            ("8", "Проверить сейчас", "Проверить и обновить ядра немедленно"),
+            ("9", "Версии ядер", "Показать установленные и доступные версии"),
+            ("0", "Назад", "Вернуться в настройки"),
+        ]
+
+        action = _render_interactive_menu("Автообновление ядер", rows)
+
+        if action == "0":
+            return
+
+        if action == "1":
+            cu_cfg["enabled"] = not enabled
+            _save_core_autoupdate(cu_cfg, f"Автообновление ядер: {'ON' if cu_cfg['enabled'] else 'OFF'}")
+            continue
+
+        if action == "2":
+            cu_cfg["auto_apply"] = not auto_apply
+            _save_core_autoupdate(
+                cu_cfg,
+                f"Режим применения: {'auto (без вопросов)' if cu_cfg['auto_apply'] else 'ask (спрашивать)'}"
+            )
+            continue
+
+        if action in ("3", "4", "5"):
+            core = {"3": "telethon", "4": "xray", "5": "mihomo"}[action]
+            new_state = not _bool_value(cu_cfg.get(core, True), True)
+            cu_cfg[core] = new_state
+            _save_core_autoupdate(cu_cfg, f"{CORE_LABELS[core]}: {'ON' if new_state else 'OFF'}")
+            continue
+
+        if action == "6":
+            raw = Prompt.ask(
+                "Интервал проверки обновлений ядер (часы), 0 = каждый запуск",
+                default=str(interval)
+            )
+            try:
+                new_interval = max(0, int(raw))
+            except (TypeError, ValueError):
+                safe_print("[yellow]Некорректное значение интервала[/]")
+                time.sleep(1.0)
+                continue
+            cu_cfg["check_interval_hours"] = new_interval
+            _save_core_autoupdate(
+                cu_cfg,
+                f"Интервал проверки: {'каждый запуск' if new_interval <= 0 else f'{new_interval} ч'}"
+            )
+            continue
+
+        if action == "7":
+            safe_print(
+                "[dim]Telethon 2.x — несовместимый rewrite API, MTProto checker рассчитан на ветку 1.x.\n"
+                "Пустое значение снимает ограничение (на свой риск).[/]"
+            )
+            raw = Prompt.ask(
+                "Строгая верхняя граница версии Telethon",
+                default=max_version or ""
+            ).strip()
+            cu_cfg["telethon_max_version"] = raw
+            _save_core_autoupdate(cu_cfg, f"Потолок Telethon: {raw or 'без ограничения'}")
+            continue
+
+        if action == "8":
+            if not UPDATER_AVAILABLE:
+                safe_print("[yellow]Модуль updater.py недоступен[/]")
+                Prompt.ask("\nНажмите Enter...", password=False)
+                continue
+
+            try:
+                summary = updater.maybe_update_cores(GLOBAL_CFG, force=True)
+                if summary.get("skipped") == "no_targets":
+                    safe_print("[yellow]Все ядра отключены в настройках автообновления[/]")
+                elif not summary.get("updated"):
+                    safe_print("[green]Все ядра актуальны[/]")
+                _handle_core_update_summary(summary)
+            except Exception as e:
+                safe_print(f"[red]Ошибка обновления ядер: {e}[/]")
+
+            Prompt.ask("\nНажмите Enter...", password=False)
+            continue
+
+        if action == "9":
+            if not UPDATER_AVAILABLE:
+                safe_print("[yellow]Модуль updater.py недоступен[/]")
+                Prompt.ask("\nНажмите Enter...", password=False)
+                continue
+
+            try:
+                statuses = updater.check_cores_status(GLOBAL_CFG)
+                _render_core_versions_table(statuses)
+            except Exception as e:
+                safe_print(f"[red]Ошибка проверки версий: {e}[/]")
+
+            Prompt.ask("\nНажмите Enter...", password=False)
+            continue
+
+
 def _render_interactive_status(mt_cfg):
     router_state = "ON" if _bool_value(GLOBAL_CFG.get("router_mode", False), False) else "OFF"
     cleanup_state = normalize_cleanup_mode(GLOBAL_CFG.get("core_cleanup_mode", "owned"))
@@ -3842,6 +4063,7 @@ def _render_interactive_status(mt_cfg):
         f"MTProto: {mt_cfg.get('max_ping_ms', 0)} ms"
     )
     status_grid.add_row("Router/Cleanup", f"{router_state} / {cleanup_state}")
+    status_grid.add_row("Автообновление ядер", _format_core_autoupdate_status())
     status_grid.add_row(
         "Output",
         f"{GLOBAL_CFG.get('output_file', 'sortedProxy.txt')} | "
@@ -4048,6 +4270,7 @@ def interactive_menu():
                 ("5", "Probe MTProto", f"{mt_cfg.get('probe_policy', 'balanced')} ({mt_cfg.get('connect_retries', 1)}/{mt_cfg.get('rpc_retries', 1)})"),
                 ("6", "CONN MTProto", "save" if _bool_value(mt_cfg.get("save_connect_only", True), True) else "off"),
                 ("7", "Login MTProto", "Авторизовать session для Promo"),
+                ("8", "Ядра: автообновление", _format_core_autoupdate_status()),
                 ("0", "Назад", "Вернуться в главное меню"),
             ]
             action = _render_interactive_menu("Настройки", settings_rows)
@@ -4199,6 +4422,10 @@ def interactive_menu():
                 Prompt.ask("\n[bold]Нажмите Enter чтобы вернуться в меню...[/]", password=False)
                 continue
 
+            if action == "8":
+                core_autoupdate_menu()
+                continue
+
         if main_choice == "3":
             service_rows = [
                 ("1", "Сброс ядер", "Убить все процессы xray/mihomo"),
@@ -4226,6 +4453,19 @@ def main():
             updater.maybe_self_update(GLOBAL_CFG)
         except Exception as e:
             safe_print(f"[yellow]Предупреждение: Ошибка проверки обновлений: {e}[/]")
+
+    force_core_update = "--update-cores" in sys.argv
+    skip_core_update = (
+        ("--no-update" in sys.argv)
+        or ("--no-core-update" in sys.argv)
+        or (os.environ.get("MKXRAY_SKIP_CORE_UPDATE") == "1")
+    )
+    if UPDATER_AVAILABLE and hasattr(updater, "maybe_update_cores") and (force_core_update or not skip_core_update):
+        try:
+            core_summary = updater.maybe_update_cores(GLOBAL_CFG, force=force_core_update)
+            _handle_core_update_summary(core_summary)
+        except Exception as e:
+            safe_print(f"[yellow]Предупреждение: Ошибка автообновления ядер: {e}[/]")
 
     agg_country_default = GLOBAL_CFG.get("agg_countries", [])
     if isinstance(agg_country_default, str):
@@ -4264,6 +4504,8 @@ def main():
     parser.add_argument("--self-test", action="store_true", help="Запустить самопроверку URL парсинга")
     parser.add_argument("--debug", action="store_true", help="Debug режим (proxies_per_batch=1, threads=1)")
     parser.add_argument("--no-update", action="store_true", help="Пропустить проверку обновлений")
+    parser.add_argument("--no-core-update", action="store_true", dest="no_core_update", help="Пропустить автообновление ядер (Telethon/Xray/Mihomo)")
+    parser.add_argument("--update-cores", action="store_true", dest="update_cores", help="Принудительно проверить и обновить ядра, затем выйти")
 
     if len(sys.argv) == 1:
         interactive_menu()
@@ -4278,7 +4520,14 @@ def main():
                 print("Running Telegram proxy parsing self-test...")
                 success = mtproto_checker.run_parser_self_test(log_func=safe_print) and success
             sys.exit(0 if success else 1)
-        
+
+        if getattr(args, 'update_cores', False):
+            # Само обновление уже отработало в начале main() с force=True
+            if not UPDATER_AVAILABLE or not hasattr(updater, "maybe_update_cores"):
+                safe_print("[yellow]Модуль updater.py не поддерживает обновление ядер[/]")
+                sys.exit(1)
+            sys.exit(0)
+
         if getattr(args, 'debug', False):
             GLOBAL_CFG['debug_mode'] = True
             GLOBAL_CFG['proxies_per_batch'] = 1

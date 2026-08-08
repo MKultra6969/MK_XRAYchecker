@@ -32,3 +32,5 @@ changelog_old.md
 VERSION_old
 all-ss-new.txt
 test_v2ray_checker_ss_mihomo.py
+core_update.state.json
+bin/*.bak

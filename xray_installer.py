@@ -1,6 +1,6 @@
 # +═════════════════════════════════════════════════════════════════════════+
 # ║                     XRAY INSTALLER MODULE                               ║
-# ║          Автоустановка и обновление Xray core                           ║
+# ║          Автоустановка и обновление Xray / Mihomo core                  ║
 # +═════════════════════════════════════════════════════════════════════════+
 # ║                               by MKultra69                              ║
 # +═════════════════════════════════════════════════════════════════════════+
@@ -19,7 +19,7 @@ import tarfile
 import gzip
 import requests
 
-__version__ = "1.1.3"
+__version__ = "1.2.0"
 
 XRAY_REPO = {
     "owner": "XTLS",
@@ -32,6 +32,13 @@ MIHOMO_REPO = {
 }
 
 INSTALL_DIR = "bin"
+
+# Суффикс для backup бинарника перед обновлением (нужен для отката)
+CORE_BACKUP_SUFFIX = ".bak"
+
+# `mihomo -v` -> "Mihomo Meta v1.19.11 windows amd64 with go1.24.4 ..."
+MIHOMO_VERSION_RE = re.compile(r'(?:mihomo|clash)[^\d]{0,32}v?(\d+\.\d+(?:\.\d+)?)', re.IGNORECASE)
+GENERIC_VERSION_RE = re.compile(r'\bv?(\d+\.\d+\.\d+)\b')
 
 OS_MAP = {
     "windows": "windows",
@@ -88,10 +95,20 @@ def _safe_print(msg, style=None):
         from rich.console import Console
         console = Console()
         console.print(msg, style=style)
-    except ImportError:
-        import re
+        return
+    except Exception:
+        # rich может отсутствовать или падать на legacy-консоли (cp1252)
+        pass
+
+    try:
         clean_msg = re.sub(r'\[.*?\]', '', str(msg))
-        print(clean_msg)
+        try:
+            print(clean_msg)
+        except UnicodeEncodeError:
+            enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(clean_msg.encode(enc, errors="replace").decode(enc, errors="replace"))
+    except Exception:
+        pass
 
 def resolve_platform():
     raw_os = platform.system().lower()
@@ -258,6 +275,295 @@ def get_current_xray_version(core_path):
         _safe_print(f"[dim]Ошибка получения версии Xray: {e}[/]")
     
     return None
+
+def get_current_mihomo_version(core_path):
+
+    if not core_path or not os.path.exists(core_path):
+        return None
+
+    for probe_cmd in ([core_path, "-v"], [core_path, "version"]):
+        try:
+            result = subprocess.run(
+                probe_cmd,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+        except subprocess.TimeoutExpired:
+            _safe_print("[dim]Таймаут при получении версии Mihomo[/]")
+            continue
+        except Exception as e:
+            _safe_print(f"[dim]Ошибка получения версии Mihomo: {e}[/]")
+            continue
+
+        output = (result.stdout or "") + (result.stderr or "")
+
+        match = MIHOMO_VERSION_RE.search(output)
+        if match:
+            return match.group(1)
+
+        match = GENERIC_VERSION_RE.search(output)
+        if match:
+            return match.group(1)
+
+    return None
+
+
+def normalize_core_flavor(flavor):
+    normalized = str(flavor or "xray").strip().lower()
+    if normalized in ("mihomo", "clash", "clash-meta", "clash_meta"):
+        return "mihomo"
+    return "xray"
+
+
+def core_label(flavor):
+    return "Mihomo" if normalize_core_flavor(flavor) == "mihomo" else "Xray"
+
+
+def get_core_version(flavor, core_path):
+    if normalize_core_flavor(flavor) == "mihomo":
+        return get_current_mihomo_version(core_path)
+    return get_current_xray_version(core_path)
+
+
+def find_installed_core(flavor):
+    """Ищет уже установленный бинарник ядра (сначала в bin/, потом рядом со скриптом)."""
+    flavor = normalize_core_flavor(flavor)
+    os_name, _ = resolve_platform()
+
+    if flavor == "mihomo":
+        binary_name = "mihomo.exe" if os_name == "windows" else "mihomo"
+    else:
+        binary_name = "xray.exe" if os_name == "windows" else "xray"
+
+    script_dir = _get_script_dir()
+    for path in (
+        os.path.join(script_dir, INSTALL_DIR, binary_name),
+        os.path.join(script_dir, binary_name),
+    ):
+        if os.path.exists(path):
+            return path
+
+    return None
+
+
+def get_core_release(flavor, target_version="latest"):
+    """Возвращает release_info для ядра: конкретный тег с fallback на latest."""
+    flavor = normalize_core_flavor(flavor)
+    target = str(target_version or "latest").strip()
+
+    if flavor == "mihomo":
+        if target and target.lower() != "latest":
+            release_info = get_specific_mihomo_release(target)
+            if release_info:
+                return release_info
+            _safe_print(f"[yellow]Версия Mihomo {target} не найдена, используем latest[/]")
+        return get_latest_mihomo_release()
+
+    if target and target.lower() != "latest":
+        release_info = get_specific_xray_release(target)
+        if release_info:
+            return release_info
+        _safe_print(f"[yellow]Версия Xray {target} не найдена, используем latest[/]")
+    return get_latest_xray_release()
+
+
+def _parse_core_version(version_str):
+    if not version_str:
+        return None
+
+    cleaned = str(version_str).strip().lstrip('vV')
+    parts = re.split(r'[.\-+]', cleaned)
+
+    result = []
+    for i in range(3):
+        if i >= len(parts):
+            result.append(0)
+            continue
+        try:
+            result.append(int(parts[i]))
+        except (ValueError, TypeError):
+            result.append(0)
+
+    return tuple(result)
+
+
+def _is_newer_core_version(current, latest):
+    current_tuple = _parse_core_version(current)
+    latest_tuple = _parse_core_version(latest)
+
+    if not current_tuple or not latest_tuple:
+        return False
+
+    return latest_tuple > current_tuple
+
+
+def check_for_core_update(flavor, core_path=None, cfg=None):
+    """
+    Проверяет, есть ли новая версия ядра.
+
+    Возвращает dict:
+      core, path, installed, latest, needs_update, release, error
+    """
+    cfg = cfg or {}
+    flavor = normalize_core_flavor(flavor)
+    label = core_label(flavor)
+
+    result = {
+        "core": flavor,
+        "path": core_path,
+        "installed": None,
+        "latest": None,
+        "needs_update": False,
+        "release": None,
+        "error": None,
+    }
+
+    resolved_path = core_path if (core_path and os.path.exists(core_path)) else find_installed_core(flavor)
+    result["path"] = resolved_path
+
+    if not resolved_path:
+        result["error"] = f"{label} не установлен"
+        return result
+
+    installed_version = get_core_version(flavor, resolved_path)
+    result["installed"] = installed_version
+
+    version_key = "mihomo_version" if flavor == "mihomo" else "xray_version"
+    release_info = get_core_release(flavor, cfg.get(version_key, "latest"))
+    if not release_info:
+        result["error"] = f"не удалось получить информацию о релизе {label}"
+        return result
+
+    result["release"] = release_info
+    result["latest"] = release_info.get("version", "") or None
+
+    if not installed_version:
+        # Версия не читается (alpha-сборка, битый бинарник) - не трогаем автоматом
+        result["error"] = f"не удалось определить установленную версию {label}"
+        return result
+
+    result["needs_update"] = _is_newer_core_version(installed_version, result["latest"])
+    return result
+
+
+def _restore_core_backup(backup_path, targets):
+    if not backup_path or not os.path.exists(backup_path):
+        return False
+
+    restored = False
+    for target in targets:
+        if not target:
+            continue
+        try:
+            shutil.copy2(backup_path, target)
+            restored = True
+            _safe_print(f"[yellow]ROLLBACK: восстановлен {target}[/]")
+        except Exception as e:
+            _safe_print(f"[red]Не удалось откатить {target}: {e}[/]")
+
+    if restored:
+        try:
+            os.remove(backup_path)
+        except Exception:
+            pass
+
+    return restored
+
+
+def _cleanup_core_backup(backup_path):
+    if not backup_path:
+        return
+    try:
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+    except Exception:
+        pass
+
+
+def update_core_binary(flavor, cfg=None, release_info=None, core_path=None):
+    """
+    Обновляет уже установленный бинарник ядра на версию из release_info.
+
+    Перед заменой делается backup, после установки бинарник проверяется
+    запросом версии; при провале выполняется откат.
+
+    Возвращает dict: core, updated, installed, latest, path, rolled_back, error
+    """
+    cfg = cfg or {}
+    flavor = normalize_core_flavor(flavor)
+    label = core_label(flavor)
+
+    result = {
+        "core": flavor,
+        "updated": False,
+        "installed": None,
+        "latest": None,
+        "path": None,
+        "rolled_back": False,
+        "error": None,
+    }
+
+    # Обновляем только уже установленное ядро: первичная установка - за ensure_*_installed
+    current_path = core_path if (core_path and os.path.exists(core_path)) else find_installed_core(flavor)
+    if not current_path:
+        result["error"] = f"{label} не установлен"
+        return result
+
+    result["path"] = current_path
+    result["installed"] = get_core_version(flavor, current_path)
+
+    if not release_info:
+        version_key = "mihomo_version" if flavor == "mihomo" else "xray_version"
+        release_info = get_core_release(flavor, cfg.get(version_key, "latest"))
+
+    if not release_info:
+        result["error"] = f"не удалось получить информацию о релизе {label}"
+        return result
+
+    result["latest"] = release_info.get("version", "") or None
+
+    backup_path = f"{current_path}{CORE_BACKUP_SUFFIX}"
+    try:
+        shutil.copy2(current_path, backup_path)
+    except Exception as e:
+        _safe_print(f"[yellow]Не удалось создать backup {label}: {e}[/]")
+        backup_path = None
+
+    if flavor == "mihomo":
+        new_path = download_and_install_mihomo(release_info, cfg)
+    else:
+        new_path = download_and_install_xray(release_info, cfg)
+
+    if not new_path:
+        result["error"] = f"установка {label} не удалась"
+        result["rolled_back"] = _restore_core_backup(backup_path, [current_path])
+        return result
+
+    # Если бинарник лежал не в bin/, синхронизируем и исходное расположение,
+    # иначе checker продолжит подхватывать старую копию.
+    same_location = os.path.abspath(new_path) == os.path.abspath(current_path)
+    if not same_location:
+        try:
+            shutil.copy2(new_path, current_path)
+        except Exception as e:
+            _safe_print(f"[yellow]Не удалось обновить копию {label} в {current_path}: {e}[/]")
+
+    verified_version = get_core_version(flavor, new_path)
+    if not verified_version:
+        _safe_print(f"[red]{label} после обновления не отвечает на запрос версии - откат[/]")
+        result["error"] = f"{label} не прошёл проверку после обновления"
+        targets = [current_path] if same_location else [current_path, new_path]
+        result["rolled_back"] = _restore_core_backup(backup_path, targets)
+        return result
+
+    _cleanup_core_backup(backup_path)
+
+    result["updated"] = True
+    result["latest"] = verified_version
+    result["path"] = new_path
+    return result
+
 
 def _resolve_mihomo_asset(release_info):
     if not release_info:

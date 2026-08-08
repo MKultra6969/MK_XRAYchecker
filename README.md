@@ -51,6 +51,7 @@
 *   **Более строгий REALITY:** валидирует `pbk` (base64url → строго 32 байта) и нормализует `sid` (shortId hex).
 *   **Self-Update:** умеет обновлять `v2rayChecker.py`, `updater.py`, `aggregator.py` и MTProto-модули из GitHub репозитория (staged `.new` + `update.pending` + перезапуск).
 *   **Auto-install core:** умеет автоматически ставить `xray` или `mihomo` (по `preferred_core`) в `./bin`.
+*   **Автообновление ядер:** держит `Telethon`, `Xray-core` и `Mihomo` в актуальных версиях (с бэкапом и откатом при провале), включается/отключается целиком и по каждому ядру.
 *   **Свитч ядра:** переключение `auto/xray/mihomo` через CLI (`--engine`) или через интерактивное меню.
 *   **MTProto в отдельном режиме:** свой output-файл, свой timeout/threads/max ping, свой пункт в меню.
 *   **MTProto Login:** отдельный CLI/TUI вход для promo data с поддержкой Telegram-кода и 2FA-пароля.
@@ -72,6 +73,54 @@
 - Конфиг: `autoupdate`:
   - `true` — обновляется автоматически без вопросов.
   - `false` — если версия устарела, спросит подтверждение.
+
+---
+
+## 🧩 Автообновление ядер (v1.9.0)
+
+Checker жёстко завязан на версии трёх «ядер», поэтому они обновляются отдельно от самого скрипта:
+
+| Ядро | Что это | Источник |
+| :--- | :--- | :--- |
+| `Telethon` | python-библиотека, на которой работает MTProto checker | PyPI |
+| `Xray-core` | основное ядро проверки прокси | GitHub Releases |
+| `Mihomo` | второе ядро (Hysteria2, YAML-only типы и т.д.) | GitHub Releases |
+
+### Как это работает
+- Проверка запускается на старте, до основной работы, и по умолчанию не чаще раза в 24 часа (время последней проверки лежит в `core_update.state.json`).
+- Обновляется **только уже установленное** ядро. Первичная установка по-прежнему за `autoinstall_xray` / `autoinstall_mihomo`, чтобы скрипт не тянул ядро, которым вы не пользуетесь.
+- Перед заменой бинарник Xray/Mihomo бэкапится. Если новый бинарник не отвечает на запрос версии — выполняется откат.
+- Telethon ставится через `pip`, после установки проверяется импорт `telethon` + `mtproto_faketls` + `mtproto_checker`. Если импорт падает — pip откатывается на прошлую версию.
+- После успешного обновления Telethon скрипт перезапускается сам: старый модуль уже загружен в процесс.
+- Апгрейд Telethon ограничен веткой `1.x` (`telethon_max_version: "2.0.0"`). Telethon 2.x — несовместимый rewrite API, MTProto checker на нём не работает. Пустая строка снимает ограничение (на свой риск).
+
+### Как включить/отключить
+Меню: `Настройки → Ядра: автообновление` — мастер-выключатель, тумблеры на каждое ядро, режим `auto`/`ask`, интервал, ручная проверка и таблица версий.
+
+Конфиг (`core_autoupdate`):
+```json
+"core_autoupdate": {
+    "enabled": true,
+    "auto_apply": true,
+    "check_interval_hours": 24,
+    "telethon": true,
+    "xray": true,
+    "mihomo": true,
+    "telethon_max_version": "2.0.0"
+}
+```
+
+CLI:
+```bash
+# проверить и обновить ядра прямо сейчас (игнорирует интервал), затем выйти
+python v2rayChecker.py --update-cores
+
+# запуск без обновления ядер (self-update скрипта остаётся)
+python v2rayChecker.py -f "list.txt" --no-core-update
+```
+
+> `--no-update` отключает и self-update скрипта, и автообновление ядер.
+> То же самое делает переменная окружения `MKXRAY_SKIP_CORE_UPDATE=1`.
 
 ---
 
@@ -168,6 +217,12 @@ python v2rayChecker.py --no-update
 - `xray_version`: `"latest"` или конкретный тег (например `"v1.8.10"`).
 - `autoinstall_mihomo`: `true|false` — автоустановка `mihomo` при отсутствии.
 - `mihomo_version`: `"latest"` или конкретный тег.
+- `core_autoupdate`: блок автообновления ядер (Telethon / Xray / Mihomo):
+  - `enabled`: мастер-выключатель проверки обновлений ядер на старте.
+  - `auto_apply`: `true` — обновлять без вопросов, `false` — спрашивать подтверждение.
+  - `check_interval_hours`: как часто проверять (`0` = каждый запуск).
+  - `telethon`, `xray`, `mihomo`: тумблер на каждое ядро отдельно.
+  - `telethon_max_version`: строгая верхняя граница версии Telethon (по умолчанию `"2.0.0"`, пустая строка = без ограничения).
 - `preferred_core`: `"auto"` / `"xray"` / `"mihomo"` — режим выбора ядра.
 - `router_mode`: `true/false` — безопасный режим для роутеров/OpenWRT.
 - `core_cleanup_mode`: `"owned"` / `"all"` / `"none"` — политика очистки старых процессов ядра.
@@ -338,6 +393,8 @@ python v2rayChecker.py --mtproto-login -u "tg://proxy?server=1.2.3.4&port=443&se
 | `--self-test` | Запустить самопроверку URL парсинга (v1.0.3) |
 | `--debug` | Debug режим (1 proxy/batch, 1 thread) (v1.0.3) |
 | `--no-update` | Пропустить проверку самообновления на старте (v1.1.0)|
+| `--update-cores` | Принудительно проверить и обновить ядра (Telethon/Xray/Mihomo), затем выйти (v1.9.0)|
+| `--no-core-update` | Пропустить только автообновление ядер (v1.9.0)|
 
 ---
 

@@ -7,18 +7,19 @@
 
 
 import os
+import re
 import sys
 import json
 import hashlib
 import subprocess
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ВЕРСИЯ И КОНФИГУРАЦИЯ
 # Эта версия используется для сравнения с GitHub releases
 # ═══════════════════════════════════════════════════════════════════════════
-__version__ = "1.8.1"
+__version__ = "1.9.0"
 
 # Настройки репо по умолчанию (можно переопределить через config.json)
 DEFAULT_REPO = {
@@ -44,6 +45,30 @@ FAILED_MARKER = "update.failed"
 BACKUP_SUFFIX = ".bak"
 PIP_TIMEOUT_SEC = 600
 SMOKE_TIMEOUT_SEC = 120
+
+# ═══════════════════════════════════════════════════════════════════════════
+# АВТООБНОВЛЕНИЕ ЯДЕР (Telethon / Xray / Mihomo)
+# ═══════════════════════════════════════════════════════════════════════════
+CORE_UPDATE_STATE_FILE = "core_update.state.json"
+TELETHON_PYPI_URL = "https://pypi.org/pypi/Telethon/json"
+TELETHON_PACKAGE = "telethon"
+
+# Telethon 2.x - это полный rewrite с несовместимым API, mtproto_checker/
+# mtproto_faketls рассчитаны на ветку 1.x. Поэтому апгрейд по умолчанию
+# ограничен сверху; снять ограничение можно пустой строкой в конфиге.
+DEFAULT_TELETHON_MAX_VERSION = "2.0.0"
+
+CORE_UPDATE_TARGETS = ("telethon", "xray", "mihomo")
+
+DEFAULT_CORE_AUTOUPDATE = {
+    "enabled": True,
+    "auto_apply": True,
+    "check_interval_hours": 24,
+    "telethon": True,
+    "xray": True,
+    "mihomo": True,
+    "telethon_max_version": DEFAULT_TELETHON_MAX_VERSION,
+}
 
 def _get_script_dir():
     return os.path.dirname(os.path.abspath(__file__))
@@ -566,6 +591,498 @@ def maybe_self_update(cfg):
 
 def get_current_version():
     return __version__
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# АВТООБНОВЛЕНИЕ ЯДЕР: конфиг и состояние
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _as_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on", "y", "да"):
+        return True
+    if text in ("0", "false", "no", "off", "n", "нет"):
+        return False
+    return default
+
+
+def get_core_autoupdate_cfg(cfg):
+    """Нормализует блок core_autoupdate из config.json, добивая дефолтами."""
+    opts = dict(DEFAULT_CORE_AUTOUPDATE)
+
+    raw = (cfg or {}).get("core_autoupdate")
+    if not isinstance(raw, dict):
+        return opts
+
+    for key in ("enabled", "auto_apply", "telethon", "xray", "mihomo"):
+        if key in raw:
+            opts[key] = _as_bool(raw.get(key), DEFAULT_CORE_AUTOUPDATE[key])
+
+    if "check_interval_hours" in raw:
+        try:
+            opts["check_interval_hours"] = max(0, int(raw.get("check_interval_hours")))
+        except (TypeError, ValueError):
+            pass
+
+    if "telethon_max_version" in raw:
+        opts["telethon_max_version"] = str(raw.get("telethon_max_version") or "").strip()
+
+    return opts
+
+
+def _core_state_path():
+    return os.path.join(_get_script_dir(), CORE_UPDATE_STATE_FILE)
+
+
+def load_core_update_state():
+    path = _core_state_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_core_update_state(state):
+    try:
+        with open(_core_state_path(), "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
+def _should_check_cores(state, interval_hours, force=False):
+    if force or interval_hours <= 0:
+        return True
+
+    last_check = (state or {}).get("last_check")
+    if not last_check:
+        return True
+
+    try:
+        last_dt = datetime.fromisoformat(str(last_check))
+    except (TypeError, ValueError):
+        return True
+
+    return datetime.now() - last_dt >= timedelta(hours=interval_hours)
+
+
+def _confirm_core_update(question, default=True):
+    """Спрашивает пользователя, если есть интерактивный stdin; иначе - отказ."""
+    try:
+        if not sys.stdin or not sys.stdin.isatty():
+            return False
+    except Exception:
+        return False
+
+    try:
+        from rich.prompt import Confirm
+        return Confirm.ask(question, default=default)
+    except ImportError:
+        pass
+    except Exception:
+        return False
+
+    try:
+        import re as _re
+        plain = _re.sub(r'\[.*?\]', '', question)
+        suffix = "[Y/n]" if default else "[y/N]"
+        response = input(f"{plain} {suffix}: ").strip().lower()
+        if not response:
+            return default
+        return response in ('y', 'yes', 'д', 'да')
+    except Exception:
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TELETHON
+# ═══════════════════════════════════════════════════════════════════════════
+
+def get_installed_telethon_version():
+    try:
+        from importlib import metadata as importlib_metadata
+    except ImportError:
+        importlib_metadata = None
+
+    if importlib_metadata is not None:
+        for dist_name in ("Telethon", "telethon"):
+            try:
+                return importlib_metadata.version(dist_name)
+            except Exception:
+                continue
+
+    try:
+        import telethon
+        return getattr(telethon, "__version__", None)
+    except Exception:
+        return None
+
+
+def _is_prerelease_version(version_str):
+    return bool(re.search(r'[A-Za-z]', str(version_str or "").strip().lstrip('vV')))
+
+
+def get_latest_telethon_version(max_version=DEFAULT_TELETHON_MAX_VERSION):
+    """
+    Возвращает последнюю stable-версию Telethon с PyPI.
+
+    max_version - строгая верхняя граница (например "2.0.0"), чтобы не улететь
+    на несовместимую мажорную ветку. Пустая строка снимает ограничение.
+    """
+    try:
+        _safe_print("[dim]Проверка последней версии Telethon (PyPI)...[/]")
+        resp = requests.get(
+            TELETHON_PYPI_URL,
+            timeout=15,
+            headers={"User-Agent": f"v2rayChecker-Updater/{__version__}"}
+        )
+        if resp.status_code != 200:
+            _safe_print(f"[yellow]PyPI вернул {resp.status_code}[/]")
+            return None
+        data = resp.json()
+    except requests.exceptions.Timeout:
+        _safe_print("[yellow]Таймаут при обращении к PyPI[/]")
+        return None
+    except requests.exceptions.RequestException as e:
+        _safe_print(f"[yellow]Ошибка сети (PyPI): {e}[/]")
+        return None
+    except Exception as e:
+        _safe_print(f"[yellow]Ошибка при проверке версии Telethon: {e}[/]")
+        return None
+
+    latest = str((data.get("info") or {}).get("version", "")).strip()
+    bound = _parse_version(max_version) if max_version else None
+
+    if not bound:
+        return latest or None
+
+    if latest and not _is_prerelease_version(latest) and _parse_version(latest) < bound:
+        return latest
+
+    # latest вышел за границу - ищем максимальную версию под ней
+    best_version = None
+    best_tuple = None
+    for version, files in (data.get("releases") or {}).items():
+        if not files:
+            continue
+        if all(f.get("yanked") for f in files):
+            continue
+        if _is_prerelease_version(version):
+            continue
+
+        parsed = _parse_version(version)
+        if parsed >= bound:
+            continue
+        if best_tuple is None or parsed > best_tuple:
+            best_tuple = parsed
+            best_version = version
+
+    if best_version:
+        _safe_print(
+            f"[dim]Telethon {latest} за пределами разрешённой ветки (< {max_version}), "
+            f"берём {best_version}[/]"
+        )
+    return best_version
+
+
+def _verify_telethon_runtime():
+    """Проверяет, что после установки Telethon импортируется вместе с MTProto-модулями."""
+    script_dir = _get_script_dir()
+    code = (
+        "import telethon\n"
+        "import mtproto_faketls, mtproto_checker\n"
+        "assert getattr(mtproto_checker, 'TELETHON_AVAILABLE', False), "
+        "getattr(mtproto_checker, 'TELETHON_IMPORT_ERROR', 'telethon unavailable')\n"
+        "print('telethon-ok')\n"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=SMOKE_TIMEOUT_SEC,
+            cwd=script_dir
+        )
+        if result.returncode == 0:
+            return True, "ok"
+        tail = (result.stderr or result.stdout or "").strip()[-1500:]
+        return False, tail or "telethon import check failed"
+    except Exception as e:
+        return False, str(e)
+
+
+def _pip_install(spec, force_reinstall=False):
+    cmd = [
+        sys.executable, "-m", "pip", "install",
+        "--disable-pip-version-check",
+        "--no-input",
+        "--upgrade",
+    ]
+    if force_reinstall:
+        cmd.append("--force-reinstall")
+    cmd.append(spec)
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=PIP_TIMEOUT_SEC,
+            cwd=_get_script_dir()
+        )
+        if result.returncode == 0:
+            return True, "ok"
+        tail = (result.stderr or result.stdout or "").strip()[-1500:]
+        return False, tail or "pip install failed"
+    except Exception as e:
+        return False, str(e)
+
+
+def check_telethon_update(opts=None):
+    """Возвращает dict: core, installed, latest, needs_update, error."""
+    opts = opts or DEFAULT_CORE_AUTOUPDATE
+    result = {
+        "core": "telethon",
+        "installed": None,
+        "latest": None,
+        "needs_update": False,
+        "error": None,
+    }
+
+    installed = get_installed_telethon_version()
+    result["installed"] = installed
+
+    if not installed:
+        result["error"] = "Telethon не установлен"
+        return result
+
+    latest = get_latest_telethon_version(opts.get("telethon_max_version", DEFAULT_TELETHON_MAX_VERSION))
+    result["latest"] = latest
+
+    if not latest:
+        result["error"] = "не удалось получить версию Telethon с PyPI"
+        return result
+
+    result["needs_update"] = _is_newer_version(installed, latest)
+    return result
+
+
+def update_telethon(target_version=None, previous_version=None):
+    """
+    Ставит Telethon нужной версии через pip и проверяет импорт.
+    При провале проверки откатывается на previous_version.
+
+    Возвращает dict: core, updated, installed, latest, rolled_back, error
+    """
+    result = {
+        "core": "telethon",
+        "updated": False,
+        "installed": previous_version or get_installed_telethon_version(),
+        "latest": target_version,
+        "rolled_back": False,
+        "error": None,
+    }
+
+    previous_version = result["installed"]
+    spec = f"{TELETHON_PACKAGE}=={target_version}" if target_version else TELETHON_PACKAGE
+
+    _safe_print(f"[cyan]Обновление Telethon: {previous_version or '?'} → {target_version or 'latest'}...[/]")
+
+    ok, msg = _pip_install(spec)
+    if not ok:
+        result["error"] = f"pip install failed: {msg}"
+        return result
+
+    verified, verify_msg = _verify_telethon_runtime()
+    if not verified:
+        _safe_print(f"[red]Telethon после обновления не проходит проверку импорта: {verify_msg}[/]")
+        if previous_version:
+            _safe_print(f"[yellow]ROLLBACK: возвращаем Telethon {previous_version}[/]")
+            back_ok, back_msg = _pip_install(f"{TELETHON_PACKAGE}=={previous_version}", force_reinstall=True)
+            result["rolled_back"] = back_ok
+            if not back_ok:
+                _safe_print(f"[red]Откат Telethon не удался: {back_msg}[/]")
+        result["error"] = f"проверка импорта не пройдена: {verify_msg}"
+        return result
+
+    result["updated"] = True
+    result["latest"] = get_installed_telethon_version() or target_version
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ОРКЕСТРАТОР: Telethon + Xray + Mihomo
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _get_xray_installer():
+    try:
+        import xray_installer
+    except ImportError as e:
+        _safe_print(f"[yellow]xray_installer недоступен: {e}[/]")
+        return None
+
+    if not hasattr(xray_installer, "check_for_core_update"):
+        _safe_print("[yellow]Текущая версия xray_installer.py не умеет обновлять ядра[/]")
+        return None
+
+    return xray_installer
+
+
+def check_cores_status(cfg, targets=None):
+    """
+    Проверяет версии всех ядер без установки обновлений.
+    Возвращает список dict'ов (по одному на ядро).
+    """
+    opts = get_core_autoupdate_cfg(cfg)
+    targets = targets or CORE_UPDATE_TARGETS
+    statuses = []
+
+    for target in targets:
+        if target == "telethon":
+            statuses.append(check_telethon_update(opts))
+            continue
+
+        installer = _get_xray_installer()
+        if not installer:
+            statuses.append({
+                "core": target, "installed": None, "latest": None,
+                "needs_update": False, "error": "xray_installer недоступен",
+            })
+            continue
+
+        statuses.append(installer.check_for_core_update(target, cfg=cfg))
+
+    return statuses
+
+
+def _apply_core_update(target, cfg, status, opts):
+    label = {"telethon": "Telethon", "xray": "Xray", "mihomo": "Mihomo"}.get(target, target)
+    installed = status.get("installed")
+    latest = status.get("latest")
+
+    _safe_print(f"[bold yellow]Доступно обновление {label}: {installed} → {latest}[/]")
+
+    if not opts.get("auto_apply", True):
+        if not _confirm_core_update(f"[bold cyan]Обновить {label} до {latest}?[/]", default=True):
+            _safe_print(f"[dim]Обновление {label} пропущено[/]")
+            return dict(status, updated=False, skipped="declined")
+
+    if target == "telethon":
+        return update_telethon(target_version=latest, previous_version=installed)
+
+    installer = _get_xray_installer()
+    if not installer:
+        return dict(status, updated=False, error="xray_installer недоступен")
+
+    return installer.update_core_binary(
+        target,
+        cfg=cfg,
+        release_info=status.get("release"),
+        core_path=status.get("path"),
+    )
+
+
+def maybe_update_cores(cfg, force=False, targets=None):
+    """
+    Точка входа автообновления ядер (Telethon / Xray / Mihomo).
+
+    force=True - игнорировать мастер-выключатель и интервал (ручной запуск из меню).
+
+    Возвращает dict:
+      checked, skipped, results, updated, restart_required
+    """
+    summary = {
+        "checked": False,
+        "skipped": None,
+        "results": [],
+        "updated": [],
+        "restart_required": False,
+    }
+
+    opts = get_core_autoupdate_cfg(cfg)
+
+    if not force and not opts.get("enabled", True):
+        summary["skipped"] = "disabled"
+        return summary
+
+    state = load_core_update_state()
+
+    if not _should_check_cores(state, opts.get("check_interval_hours", 24), force=force):
+        summary["skipped"] = "throttled"
+        return summary
+
+    # force снимает мастер-выключатель и интервал, но per-core тумблеры уважаются
+    if targets is None:
+        targets = [t for t in CORE_UPDATE_TARGETS if opts.get(t, True)]
+
+    if not targets:
+        summary["skipped"] = "no_targets"
+        return summary
+
+    summary["checked"] = True
+    _safe_print("[dim]Проверка обновлений ядер (Telethon/Xray/Mihomo)...[/]")
+
+    for target in targets:
+        try:
+            if target == "telethon":
+                status = check_telethon_update(opts)
+            else:
+                installer = _get_xray_installer()
+                if not installer:
+                    continue
+                status = installer.check_for_core_update(target, cfg=cfg)
+        except Exception as e:
+            _safe_print(f"[yellow]Ошибка проверки {target}: {e}[/]")
+            summary["results"].append({"core": target, "error": str(e), "updated": False})
+            continue
+
+        if status.get("error"):
+            _safe_print(f"[dim]{target}: {status['error']}[/]")
+            summary["results"].append(dict(status, updated=False))
+            continue
+
+        if not status.get("needs_update"):
+            _safe_print(f"[dim]{target}: версия актуальна ({status.get('installed')})[/]")
+            summary["results"].append(dict(status, updated=False))
+            continue
+
+        try:
+            applied = _apply_core_update(target, cfg, status, opts)
+        except Exception as e:
+            _safe_print(f"[red]Ошибка обновления {target}: {e}[/]")
+            applied = dict(status, updated=False, error=str(e))
+
+        summary["results"].append(applied)
+
+        if applied.get("updated"):
+            summary["updated"].append(target)
+            _safe_print(
+                f"[bold green]✓ {target} обновлён: "
+                f"{applied.get('installed')} → {applied.get('latest')}[/]"
+            )
+            if target == "telethon":
+                summary["restart_required"] = True
+
+    state["last_check"] = datetime.now().isoformat()
+    state["versions"] = {
+        item.get("core"): (item.get("latest") if item.get("updated") else item.get("installed"))
+        for item in summary["results"] if item.get("core")
+    }
+    save_core_update_state(state)
+
+    return summary
+
 
 if __name__ == "__main__":
     print(f"Updater module version: {__version__}")
