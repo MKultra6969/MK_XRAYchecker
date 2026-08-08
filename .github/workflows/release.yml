@@ -1,0 +1,277 @@
+name: Release
+
+# Ручной релиз: Actions -> Release -> Run workflow.
+# Собирает GitHub Release из текущего состояния ветки: тег vX.Y.Z, тело из
+# changelog.md и те же файлы-ассеты, что выкладывались руками.
+#
+# ВАЖНО: updater.py скачивает python-файлы НЕ из ассетов релиза, а из
+# raw.githubusercontent.com/<owner>/<repo>/<repo_branch>/ (по умолчанию main).
+# Релиз нужен ему только чтобы узнать номер последней версии из tag_name.
+# Поэтому релиз обязан собираться из той же ветки, откуда качают пользователи.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Версия релиза, например 1.9.0 (пусто = взять из файла VERSION)'
+        required: false
+        type: string
+        default: ''
+      prerelease:
+        description: 'Пометить как pre-release'
+        required: false
+        type: boolean
+        default: false
+      draft:
+        description: 'Создать черновик вместо публикации'
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Только проверки, релиз не создавать'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  # Ассеты релиза. Порядок значения не имеет.
+  RELEASE_FILES: >-
+    v2rayChecker.py
+    updater.py
+    xray_installer.py
+    mtproto_checker.py
+    mtproto_faketls.py
+    aggregator.py
+    requirements.txt
+    VERSION
+    README.md
+    LICENSE.md
+
+jobs:
+  release:
+    name: Собрать и опубликовать релиз
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Определить версию и тег
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          file_version="$(tr -d ' \t\r\n' < VERSION)"
+          file_version="${file_version#v}"
+
+          if [ -n "${INPUT_VERSION}" ]; then
+            version="${INPUT_VERSION}"
+          else
+            version="${file_version}"
+          fi
+          version="$(printf '%s' "${version}" | tr -d ' \t\r\n')"
+          version="${version#v}"
+
+          if ! printf '%s' "${version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Некорректная версия '${version}', ожидается MAJOR.MINOR.PATCH"
+            exit 1
+          fi
+
+          echo "version=${version}"           >> "$GITHUB_OUTPUT"
+          echo "file_version=${file_version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}"              >> "$GITHUB_OUTPUT"
+          echo "Версия релиза: ${version} (тег v${version})"
+
+      - name: Проверить ветку
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          DRAFT: ${{ inputs.draft }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          if [ "${REF_NAME}" = "main" ]; then
+            echo "Ветка main - ок."
+            exit 0
+          fi
+
+          echo "::warning::Релиз собирается из ветки '${REF_NAME}', а updater качает файлы из main."
+          if [ "${DRAFT}" != "true" ] && [ "${DRY_RUN}" != "true" ]; then
+            echo "::error::Публикация не из main сломает автообновление: тег поднимет версию у всех, а файлы пользователи получат из main. Запустите workflow из main либо соберите как draft."
+            exit 1
+          fi
+
+      - name: Проверить согласованность версий
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          FILE_VERSION: ${{ steps.version.outputs.file_version }}
+        run: |
+          set -euo pipefail
+
+          if [ "${VERSION}" != "${FILE_VERSION}" ]; then
+            echo "::error::Версия релиза (${VERSION}) не совпадает с файлом VERSION (${FILE_VERSION}). Обновите VERSION или укажите версию вручную осознанно."
+            exit 1
+          fi
+
+          # без grep -P: он требует UTF-8 локали, а в файле кириллица
+          quotes=$'\x22\x27'
+          script_version="$(grep -m1 '^__version__' v2rayChecker.py | cut -d= -f2- | tr -d " \t\r\n${quotes}")"
+          if [ -z "${script_version}" ]; then
+            echo "::error::Не удалось прочитать __version__ из v2rayChecker.py"
+            exit 1
+          fi
+          if [ "${script_version}" != "${VERSION}" ]; then
+            echo "::error::v2rayChecker.py __version__ = ${script_version}, а релиз собирается как ${VERSION}. Updater сравнивает именно __version__, рассинхрон вызовет бесконечный цикл обновления."
+            exit 1
+          fi
+
+          echo "VERSION, __version__ и запрошенная версия совпадают: ${VERSION}"
+
+      - name: Проверить, что релиз ещё не существует
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Тег ${TAG} уже существует. Поднимите версию или удалите тег."
+            exit 1
+          fi
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "::error::Релиз ${TAG} уже существует."
+            exit 1
+          fi
+
+          echo "Тег ${TAG} свободен."
+
+      - name: Проверить наличие файлов релиза
+        run: |
+          set -euo pipefail
+
+          missing=""
+          for f in ${RELEASE_FILES}; do
+            if [ ! -f "$f" ]; then
+              missing="${missing} ${f}"
+            fi
+          done
+
+          if [ -n "${missing}" ]; then
+            echo "::error::Нет файлов для релиза:${missing}"
+            exit 1
+          fi
+
+          echo "Все ассеты на месте:"
+          for f in ${RELEASE_FILES}; do
+            printf '  %-24s %s байт\n' "$f" "$(stat -c%s "$f")"
+          done
+
+      - name: Smoke-check синтаксиса
+        run: |
+          set -euo pipefail
+
+          python3 -m py_compile \
+            v2rayChecker.py \
+            updater.py \
+            xray_installer.py \
+            mtproto_checker.py \
+            mtproto_faketls.py \
+            aggregator.py
+
+          echo "py_compile прошёл."
+
+      - name: Собрать release notes из changelog.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # index() вместо регекспа: не нужно экранировать [ ] в awk-строке
+          awk -v ver="${VERSION}" '
+            BEGIN { want = "## [" ver "]" }
+            index($0, want) == 1        { found = 1; next }
+            found && index($0, "## [") == 1 { exit }
+            found                       { print }
+          ' changelog.md > release_notes.md
+
+          # ВАЖНО: проверяем пустоту ДО нормализации. Любой printf/sed ниже
+          # оставит хотя бы перевод строки, и проверка размера станет бесполезной.
+          if ! grep -q '[^[:space:]]' release_notes.md; then
+            echo "::error::В changelog.md нет секции '## [${VERSION}]'. Добавьте её перед релизом."
+            exit 1
+          fi
+
+          # убираем ведущие и хвостовые пустые строки
+          sed -i -e '/./,$!d' release_notes.md
+          tac release_notes.md | sed -e '/./,$!d' | tac > release_notes.tmp
+          mv release_notes.tmp release_notes.md
+
+          echo "----- release notes -----"
+          cat release_notes.md
+          echo "-------------------------"
+
+      - name: Создать релиз
+        if: ${{ inputs.dry_run == false }}
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          DRAFT: ${{ inputs.draft }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          flags=()
+          if [ "${DRAFT}" = "true" ]; then
+            flags+=(--draft)
+          fi
+          if [ "${PRERELEASE}" = "true" ]; then
+            flags+=(--prerelease)
+          fi
+
+          gh release create "${TAG}" \
+            --target "${GITHUB_SHA}" \
+            --title "${TAG}" \
+            --notes-file release_notes.md \
+            "${flags[@]}" \
+            ${RELEASE_FILES}
+
+          echo "Релиз ${TAG} создан."
+
+      - name: Итог
+        if: ${{ always() }}
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          DRAFT: ${{ inputs.draft }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Релиз ${TAG}"
+            echo ""
+            echo "| Параметр | Значение |"
+            echo "| :--- | :--- |"
+            echo "| Тег | \`${TAG}\` |"
+            echo "| Ветка | \`${GITHUB_REF_NAME}\` |"
+            echo "| Коммит | \`${GITHUB_SHA}\` |"
+            echo "| Draft | ${DRAFT} |"
+            echo "| Pre-release | ${PRERELEASE} |"
+            echo "| Dry run | ${DRY_RUN} |"
+            echo ""
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "Проверки прошли, релиз не создавался (dry run)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
