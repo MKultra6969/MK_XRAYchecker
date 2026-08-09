@@ -71,11 +71,16 @@ class TcpPingOptionsTests(unittest.TestCase):
     def setUpClass(cls):
         cls.mod = _load_v2ray_checker()
 
-    def test_defaults_from_config(self):
+    def test_disabled_by_default(self):
+        # Отсев судит прокси по TCP-коннекту, поэтому включается только осознанно.
         opts = self.mod.build_tcp_ping_options(None, {})
-        self.assertTrue(opts["enabled"])
+        self.assertFalse(opts["enabled"])
         self.assertGreater(opts["timeout"], 0)
         self.assertGreaterEqual(opts["concurrency"], 1)
+
+    def test_cli_flag_enables_without_config(self):
+        args = type("A", (), {"tcp_ping": True})()
+        self.assertTrue(self.mod.build_tcp_ping_options(args, {})["enabled"])
 
     def test_cli_overrides_config(self):
         args = type("A", (), {
@@ -114,8 +119,11 @@ class TcpPingFilterTests(unittest.TestCase):
 
     def setUp(self):
         self.opts = self.mod.build_tcp_ping_options(None, {})
-        # Windows refuses a closed loopback port only after ~2s (ConnectEx SYN retry).
-        self.opts.update({"timeout": 6.0, "concurrency": 8, "retries": 0, "report_file": ""})
+        # enabled: отсев выключен по умолчанию, эти тесты проверяют саму фильтрацию.
+        # timeout: Windows refuses a closed loopback port only after ~2s (ConnectEx SYN retry).
+        self.opts.update({
+            "enabled": True, "timeout": 6.0, "concurrency": 8, "retries": 0, "report_file": "",
+        })
 
     def _vless(self, port):
         return f"vless://{_UUID}@127.0.0.1:{port}?security=none&sni=a.example.com"

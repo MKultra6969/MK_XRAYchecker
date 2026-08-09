@@ -375,8 +375,10 @@ DEFAULT_CONFIG = {
     # Ядро вообще не поднимается для прокси, который не принимает TCP.
     # Идея: Telegram @loliconshik
     "tcp_ping": {
-        # Мастер-выключатель предфильтра
-        "enabled": True,
+        # Мастер-выключатель предфильтра. По умолчанию OFF: отсев судит прокси
+        # по TCP-коннекту, и на кривом канале может выкинуть живые ссылки.
+        # Включается осознанно — в меню, ключом или флагом --tcp-ping.
+        "enabled": False,
         # Таймаут одной TCP-попытки (сек).
         # Ниже 2.5 ставить не стоит: на Windows ConnectEx отдаёт "refused"
         # только через ~2с (SYN-ретрай), и отказ начнёт читаться как timeout.
@@ -2645,7 +2647,7 @@ def build_tcp_ping_options(args=None, cfg=None):
         except (TypeError, ValueError):
             return caster(default)
 
-    enabled = _bool_value(raw.get("enabled", True), True)
+    enabled = _bool_value(raw.get("enabled", False), False)
     cli_enabled = getattr(args, "tcp_ping", None) if args is not None else None
     if cli_enabled is not None:
         enabled = bool(cli_enabled)
@@ -4428,7 +4430,7 @@ def core_autoupdate_menu():
 
 def _format_tcp_ping_status():
     tcp_cfg = get_tcp_ping_config(GLOBAL_CFG)
-    if not _bool_value(tcp_cfg.get("enabled", True), True):
+    if not _bool_value(tcp_cfg.get("enabled", False), False):
         return "OFF"
 
     parts = [
@@ -4469,7 +4471,7 @@ def _ask_number(question, current, caster, low, high):
 def tcp_ping_menu():
     while True:
         tcp_cfg = get_tcp_ping_config(GLOBAL_CFG)
-        enabled = _bool_value(tcp_cfg.get("enabled", True), True)
+        enabled = _bool_value(tcp_cfg.get("enabled", False), False)
         skip_udp = _bool_value(tcp_cfg.get("skip_udp", True), True)
         max_latency = int(tcp_cfg.get("max_latency_ms", 0) or 0)
         report_file = str(tcp_cfg.get("report_file", "") or "").strip()
