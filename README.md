@@ -36,6 +36,7 @@
 - [Быстрый старт](#-быстрый-старт)
 - [Возможности](#-возможности)
 - [Типовые сценарии](#-типовые-сценарии)
+- [TCP ping отсев](#-tcp-ping-отсев)
 - [Ядро: Xray / Mihomo](#-ядро-xray--mihomo)
 - [MTProto режим](#-mtproto-режим)
 - [Настройка](#-настройка)
@@ -66,6 +67,7 @@ python v2rayChecker.py
 *   **Batch Mode:** 1 ядро = 1 пачка прокси (для `xray` внутри пачки проверки идут параллельно). UP TO 1337 BATCHES.
 *   **Два ядра:** `Xray` и `Mihomo`, выбор `auto/xray/mihomo` через CLI (`--engine`) или интерактивное меню.
 *   **Сортировка:** Автоматически сортирует рабочие прокси по пингу или скорости.
+*   **TCP ping отсев:** Перед запуском ядра checker делает обычный TCP-коннект до `host:port` и выкидывает мёртвые ссылки. Ядро не тратит время на то, что и так не отвечает. Настраивается целиком: таймаут, потоки, ретраи, порог RTT.
 *   **Отсев по ping:** Можно задать порог `max_ping_ms` (например `500`) и автоматически выкидывать медленные прокси.
 *   **SpeedTest:** Проверка скорости скачивания (опционально).
 
@@ -109,11 +111,42 @@ python v2rayChecker.py -f "list.txt" -T 50 -t 2
 # MTProto checker по файлу
 python v2rayChecker.py --mtproto -f "mtproto.txt"
 
+# Только TCP ping отсев: живые host:port в файл, ядро не запускается
+python v2rayChecker.py --tcp-ping-only -f "huge_list.txt" -o "tcp_alive.txt"
+
 # Запустить без проверки обновлений
 python v2rayChecker.py --no-update
 ```
 
 Полная таблица аргументов — в [docs/cli.md](docs/cli.md).
+
+---
+
+## 📡 TCP ping отсев
+
+Перед тем как поднимать ядро, checker проверяет самое дешёвое: принимает ли `host:port` обычный TCP-коннект. Мёртвые ссылки отваливаются здесь, и ядро запускается только для тех, что вообще отвечают.
+
+```bash
+# отсев включён по умолчанию, отключить на один запуск
+python v2rayChecker.py -f "list.txt" --no-tcp-ping
+
+# подкрутить под свой канал
+python v2rayChecker.py -f "list.txt" --tcp-ping-timeout 2 --tcp-ping-concurrency 1000
+
+# выкинуть ещё и всё, до чего TCP RTT больше 300 мс
+python v2rayChecker.py -f "list.txt" --tcp-ping-max-ms 300
+```
+
+Что нужно знать:
+
+- **UDP/QUIC-протоколы** (`hysteria`, `hysteria2`, `tuic`, `wireguard`) отсев **не трогает**: TCP-коннект на их порт ничего не проверяет и выбросил бы живые прокси. Отключается ключом `skip_udp`.
+- Ссылки без распознанного `host:port` проходят дальше нетронутыми — отсев удаляет только то, что реально проверил.
+- Ретраится только timeout. `refused` — окончательный ответ хоста, повторять его бессмысленно.
+- `--tcp-ping-max-ms` — это порог **TCP RTT до сервера**, а не ping через прокси. Второй, полноценный порог — это `--max-ping`.
+
+**Меню:** `Настройки → TCP ping отсев` (все параметры) и `Проверка → TCP ping отсев` (прогнать файл только через отсев).
+
+Все ключи блока `tcp_ping` — в [docs/config.md](docs/config.md).
 
 ---
 
@@ -177,6 +210,7 @@ python v2rayChecker.py --mtproto-login
 | `threads` | сколько ядер запускается одновременно |
 | `timeout` | таймаут ответа в секундах |
 | `max_ping_ms` | порог ping в миллисекундах для отсева (`0` = отключено) |
+| `tcp_ping` | блок TCP ping отсева перед запуском ядра (`enabled`, `timeout`, `concurrency`, ...) |
 | `router_mode` | `true/false` — безопасный режим для роутеров/OpenWRT |
 | `core_cleanup_mode` | `"owned"` / `"all"` / `"none"` — политика очистки старых процессов ядра |
 | `autoupdate` | `true/false` — автообновление скрипта |
@@ -249,6 +283,8 @@ python v2rayChecker.py -f "proxies.txt" --debug
 **Веб:** [mk69.su](http://mk69.su)
 
 **FELIX:** [Оригинал aggregator.py + хороший фидбек](https://github.com/y9felix/s)
+
+**@loliconshik:** [Telegram](https://t.me/loliconshik) — за идею TCP ping отсева
 
 ### 📜 License
 Проект КАК ВСЕГДА распространяется под лицензией **WTFPL** (Do What The Fuck You Want To Public License).

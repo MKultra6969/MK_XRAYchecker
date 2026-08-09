@@ -19,18 +19,20 @@
 # ║                                  mk69.su                                ║
 # +═════════════════════════════════════════════════════════════════════════+
 # +═════════════════════════════════════════════════════════════════════════+
-# ║                           VERSION 1.9.0                                 ║
+# ║                           VERSION 1.10.0                                ║
 # ║             В случае багов/недочётов создайте issue на github           ║
 # ║                                                                         ║
 # +═════════════════════════════════════════════════════════════════════════+
 
 
 import argparse
+import asyncio
 import copy
 import tempfile
 import sys
 import os
 import shutil
+import ipaddress
 import logging
 import random
 import time
@@ -61,7 +63,7 @@ YAML_WARNED = False
 
 # ВЕРСИЯ СКРИПТА
 # Формат: MAJOR.MINOR.PATCH (SemVer)
-__version__ = "1.9.0"
+__version__ = "1.10.0"
 
 
 def _ensure_utf8_stdio():
@@ -368,6 +370,35 @@ DEFAULT_CONFIG = {
     # Максимальный ping (мс) для отсева. 0 = не фильтровать по ping.
     "max_ping_ms": 666,
 
+    # TCP PING PREFILTER
+    # Отсев мёртвых host:port обычным TCP-коннектом ДО запуска ядра.
+    # Ядро вообще не поднимается для прокси, который не принимает TCP.
+    # Идея: Telegram @loliconshik
+    "tcp_ping": {
+        # Мастер-выключатель предфильтра
+        "enabled": True,
+        # Таймаут одной TCP-попытки (сек).
+        # Ниже 2.5 ставить не стоит: на Windows ConnectEx отдаёт "refused"
+        # только через ~2с (SYN-ретрай), и отказ начнёт читаться как timeout.
+        "timeout": 3.0,
+        # Сколько TCP-коннектов держим одновременно
+        "concurrency": 500,
+        # Доп. попытки перед вердиктом "мёртв". Ретраится только timeout:
+        # refused/unreachable — это уже окончательный ответ хоста.
+        "retries": 1,
+        # Верхний порог TCP RTT (мс). 0 = только живой/мёртвый, без порога
+        "max_latency_ms": 0,
+        # Не трогать UDP/QUIC-протоколы (hysteria/hysteria2/tuic/wireguard):
+        # TCP-коннект на их порт ничего не доказывает и убьёт живые прокси
+        "skip_udp": True,
+        # Таймаут DNS-резолва хоста (сек). Резолв кешируется на весь прогон
+        "resolve_timeout": 5.0,
+        # Сколько A/AAAA записей пробовать, если хост резолвится в несколько IP
+        "max_ips_per_host": 2,
+        # Опциональный файл со списком живых ip:port (пусто = не писать)
+        "report_file": ""
+    },
+
     # Агрегатор: предфильтр по странам (ISO2) до массовой GeoIP-проверки.
     "agg_countries": [],
 
@@ -434,6 +465,14 @@ def get_mtproto_config(cfg=None):
     source = cfg if isinstance(cfg, dict) else GLOBAL_CFG
     base = copy.deepcopy(DEFAULT_CONFIG.get("mtproto", {}))
     user_value = source.get("mtproto", {}) if isinstance(source, dict) else {}
+    merged, _ = _merge_with_defaults(base, user_value)
+    return merged
+
+
+def get_tcp_ping_config(cfg=None):
+    source = cfg if isinstance(cfg, dict) else GLOBAL_CFG
+    base = copy.deepcopy(DEFAULT_CONFIG.get("tcp_ping", {}))
+    user_value = source.get("tcp_ping", {}) if isinstance(source, dict) else {}
     merged, _ = _merge_with_defaults(base, user_value)
     return merged
 
@@ -2563,6 +2602,287 @@ def drop_proxy_by_outbound_tag(active_proxy_list, valid_mapping, out_tag):
         new_list.append(item)
     return new_list, dropped_url
 
+# ============================================================================
+# TCP PING PREFILTER
+# Отсев мёртвых host:port до запуска ядра.
+# Идея: Telegram @loliconshik
+# ============================================================================
+
+# QUIC/UDP-транспорты: TCP-коннект на их порт ничего не проверяет.
+TCP_PING_UDP_PROTOCOLS = frozenset({
+    "hysteria", "hysteria2", "hy2", "tuic", "wireguard", "shadowquic", "masque",
+})
+
+
+def tcp_ping_endpoint(proxy_url):
+    """Return (host, port, is_udp) the core would dial, or None if not probeable."""
+    parsed = parse_proxy_url(proxy_url)
+    if not parsed:
+        return None
+    if parsed.get("_native_mihomo"):
+        proto = str(parsed.get("type", "")).lower()
+        host = _first_scalar(parsed.get("server"))
+        port = parsed.get("port")
+    else:
+        proto = str(parsed.get("protocol", "")).lower()
+        host = parsed.get("address")
+        port = parsed.get("port")
+    if not proto or proto == "unsupported" or not host or not is_valid_port(port):
+        return None
+    return str(host), int(port), proto in TCP_PING_UDP_PROTOCOLS
+
+
+def build_tcp_ping_options(args=None, cfg=None):
+    """Merge tcp_ping config with CLI overrides and clamp everything to sane ranges."""
+    raw = get_tcp_ping_config(cfg)
+
+    def pick(attr, key, caster, default):
+        value = getattr(args, attr, None) if (args is not None and attr) else None
+        if value is None:
+            value = raw.get(key, default)
+        try:
+            return caster(value)
+        except (TypeError, ValueError):
+            return caster(default)
+
+    enabled = _bool_value(raw.get("enabled", True), True)
+    cli_enabled = getattr(args, "tcp_ping", None) if args is not None else None
+    if cli_enabled is not None:
+        enabled = bool(cli_enabled)
+
+    opts = {
+        "enabled": enabled,
+        "timeout": min(max(pick("tcp_ping_timeout", "timeout", float, 3.0), 0.1), 60.0),
+        "concurrency": min(max(pick("tcp_ping_concurrency", "concurrency", int, 500), 1), 5000),
+        "retries": min(max(pick("tcp_ping_retries", "retries", int, 1), 0), 5),
+        "max_latency_ms": max(pick("tcp_ping_max_ms", "max_latency_ms", int, 0), 0),
+        "skip_udp": _bool_value(raw.get("skip_udp", True), True),
+        "resolve_timeout": min(max(pick(None, "resolve_timeout", float, 5.0), 0.1), 60.0),
+        "max_ips_per_host": min(max(pick(None, "max_ips_per_host", int, 2), 1), 8),
+        "report_file": str(raw.get("report_file", "") or "").strip(),
+    }
+    return opts
+
+
+async def _tcp_ping_resolve(host, opts):
+    """Resolve host to a short IP list; literal IPs skip DNS entirely."""
+    try:
+        ipaddress.ip_address(host)
+        return [host]
+    except ValueError:
+        pass
+
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM),
+            timeout=opts["resolve_timeout"],
+        )
+    except Exception:
+        return []
+
+    ips = []
+    for info in infos:
+        ip = info[4][0]
+        if ip not in ips:
+            ips.append(ip)
+        if len(ips) >= opts["max_ips_per_host"]:
+            break
+    return ips
+
+
+def _tcp_ping_resolve_cached(host, opts, dns_cache):
+    """One in-flight resolve per host; awaiting the same task twice is fine."""
+    task = dns_cache.get(host)
+    if task is None:
+        task = asyncio.ensure_future(_tcp_ping_resolve(host, opts))
+        dns_cache[host] = task
+    return task
+
+
+async def _tcp_ping_connect(ip, port, timeout):
+    """Return (latency_ms, reason). Only 'timeout' is worth retrying."""
+    started = time.perf_counter()
+    writer = None
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port), timeout=timeout
+        )
+        return (time.perf_counter() - started) * 1000.0, "ok"
+    except asyncio.TimeoutError:
+        return None, "timeout"
+    except ConnectionRefusedError:
+        return None, "refused"
+    except OSError:
+        return None, "unreachable"
+    except Exception:
+        return None, "error"
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+
+async def _tcp_ping_probe(host, port, opts, dns_cache):
+    """Return (latency_ms, reason) for one proxy endpoint."""
+    ips = await _tcp_ping_resolve_cached(host, opts, dns_cache)
+    if not ips:
+        return None, "dns"
+
+    reason = "dead"
+    for attempt in range(opts["retries"] + 1):
+        retryable = False
+        for ip in ips:
+            latency, reason = await _tcp_ping_connect(ip, port, opts["timeout"])
+            if latency is not None:
+                return latency, "ok"
+            if reason == "timeout":
+                retryable = True
+        # refused/unreachable/dns — хост ответил окончательно, ретрай не поможет
+        if not retryable or attempt >= opts["retries"]:
+            break
+    return None, reason
+
+
+async def _tcp_ping_worker(entries, opts, dns_cache, results, on_done):
+    # Общий синхронный итератор безопасен: event loop однопоточный.
+    for index, host, port in entries:
+        latency, reason = await _tcp_ping_probe(host, port, opts, dns_cache)
+        results[index] = (latency, reason)
+        on_done(latency, reason)
+
+
+async def _tcp_ping_gather(probe_entries, opts, results, on_done):
+    loop = asyncio.get_running_loop()
+    # Bulk-сканер роняет кучу транспортов на полуслове; шум в лог не нужен.
+    loop.set_exception_handler(lambda _loop, _context: None)
+
+    entries = iter(probe_entries)
+    dns_cache = {}
+    worker_count = min(opts["concurrency"], len(probe_entries))
+    workers = [
+        asyncio.ensure_future(_tcp_ping_worker(entries, opts, dns_cache, results, on_done))
+        for _ in range(max(worker_count, 1))
+    ]
+    try:
+        await asyncio.gather(*workers)
+    finally:
+        for task in dns_cache.values():
+            if not task.done():
+                task.cancel()
+
+
+def build_progress_columns():
+    return [
+        SpinnerColumn(style="bold yellow"),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=40, style="dim", complete_style="green", finished_style="bold green"),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+    ]
+
+
+def format_tcp_ping_summary(stats):
+    parts = [
+        f"живых: {stats['alive']}",
+        f"отсеяно: {stats['dead']}",
+    ]
+    if stats["slow"]:
+        parts.append(f"по порогу RTT: {stats['slow']}")
+    if stats["skipped_udp"]:
+        parts.append(f"UDP пропущено: {stats['skipped_udp']}")
+    if stats["skipped_unknown"]:
+        parts.append(f"без host:port: {stats['skipped_unknown']}")
+    parts.append(f"за {stats['elapsed']:.1f}s")
+    return ", ".join(parts)
+
+
+def tcp_ping_filter(proxy_list, opts, show_progress=True, task_desc="TCP ping prefilter..."):
+    """Drop proxies whose host:port refuses a plain TCP connection.
+
+    Returns (kept_list, stats). Order of `proxy_list` is preserved and the input
+    list is never mutated. Proxies without a probeable host:port (and UDP-only
+    ones when `skip_udp`) pass through untouched — the prefilter only removes
+    what it actually proved dead.
+    """
+    stats = {
+        "total": len(proxy_list), "probed": 0, "alive": 0, "dead": 0, "slow": 0,
+        "skipped_udp": 0, "skipped_unknown": 0, "elapsed": 0.0,
+    }
+    if not proxy_list or not opts.get("enabled"):
+        return list(proxy_list), stats
+
+    keep_flags = [False] * len(proxy_list)
+    probe_entries = []
+    for index, proxy in enumerate(proxy_list):
+        endpoint = tcp_ping_endpoint(proxy)
+        if endpoint is None:
+            stats["skipped_unknown"] += 1
+            keep_flags[index] = True
+            continue
+        host, port, is_udp = endpoint
+        if is_udp and opts["skip_udp"]:
+            stats["skipped_udp"] += 1
+            keep_flags[index] = True
+            continue
+        probe_entries.append((index, host, port))
+
+    if not probe_entries:
+        return list(proxy_list), stats
+
+    results = {}
+    started = time.perf_counter()
+
+    if show_progress:
+        with Progress(*build_progress_columns(), console=console, transient=False) as progress:
+            task_id = progress.add_task(f"[cyan]{task_desc}", total=len(probe_entries))
+            live = {"alive": 0}
+
+            def on_done(latency, _reason):
+                if latency is not None:
+                    live["alive"] += 1
+                progress.update(
+                    task_id, advance=1,
+                    description=f"[cyan]{task_desc} [green]alive {live['alive']}[/]"
+                )
+
+            asyncio.run(_tcp_ping_gather(probe_entries, opts, results, on_done))
+    else:
+        asyncio.run(_tcp_ping_gather(probe_entries, opts, results, lambda latency, reason: None))
+
+    stats["elapsed"] = time.perf_counter() - started
+    stats["probed"] = len(probe_entries)
+
+    max_latency = opts["max_latency_ms"]
+    alive_endpoints = []
+    for index, host, port in probe_entries:
+        latency, _reason = results.get(index, (None, "skipped"))
+        if latency is None:
+            stats["dead"] += 1
+            continue
+        if max_latency and latency > max_latency:
+            stats["slow"] += 1
+            stats["dead"] += 1
+            continue
+        stats["alive"] += 1
+        keep_flags[index] = True
+        alive_endpoints.append((host, port, latency))
+
+    if opts["report_file"]:
+        try:
+            with open(opts["report_file"], "w", encoding="utf-8") as report:
+                for host, port, latency in alive_endpoints:
+                    report.write(f"{host}:{port} {latency:.0f}ms\n")
+        except Exception as e:
+            safe_print(f"[yellow]>> Не удалось записать TCP ping отчёт: {e}[/]")
+
+    return [proxy for index, proxy in enumerate(proxy_list) if keep_flags[index]], stats
+
+
 def check_connection(local_port, domain, timeout):
     proxies = {
         'http': f'socks5://127.0.0.1:{local_port}',
@@ -2966,6 +3286,13 @@ def apply_mtproto_arg_defaults(args):
 
     args.sort_by = "ping"
     args.speed_check = False
+    return args
+
+
+def apply_tcp_ping_arg_defaults(args):
+    # Standalone-отсев не должен молча затирать sortedProxy.txt с результатами проверки.
+    if getattr(args, "tcp_ping_only", False) and not _arg_was_provided("-o", "--output"):
+        args.output = "tcp_alive.txt"
     return args
 
 
@@ -3400,6 +3727,118 @@ def run_mtproto_login_logic(args):
     safe_print(f"[green]✓ MTProto promo session authorized: {user_label}. Теперь можно запускать --mtproto.[/]")
 
 
+def collect_input_proxies(args):
+    """Read file/url/aggregator/reuse sources into one deduplicated proxy list."""
+    lines = {}
+    total_found_raw = 0
+
+    if args.file:
+        fpath = args.file.strip('"')
+        if os.path.exists(fpath):
+            safe_print(f"[cyan]>> Чтение файла: {fpath}[/]")
+            with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                file_payload = f.read()
+                parsed, count = parse_content(file_payload)
+                total_found_raw += count
+                _merge_proxy_entries(lines, parsed)
+                safe_print(f"[dim]>> Прямых ссылок в файле: {len(parsed)}[/]")
+
+                sub_urls = extract_subscription_urls(file_payload)
+                if sub_urls:
+                    safe_print(f"[cyan]>> Найдено URL-подписок в файле: {len(sub_urls)}[/]")
+                    before_sub_merge = len(lines)
+                    fetched_sub_total = 0
+                    for sub_url in sub_urls:
+                        links = fetch_url(sub_url)
+                        fetched_sub_total += len(links)
+                        _merge_proxy_entries(lines, links)
+                    added_unique = len(lines) - before_sub_merge
+                    safe_print(
+                        f"[dim]>> Из подписок получено: {fetched_sub_total}, "
+                        f"добавлено уникальных: {added_unique}[/]"
+                    )
+
+    if args.url:
+        links = fetch_url(args.url)
+        _merge_proxy_entries(lines, links)
+
+    if AGGREGATOR_AVAILABLE and getattr(args, 'agg', False):
+        sources_map = GLOBAL_CFG.get("sources", {})
+        cats = args.agg_cats if args.agg_cats else list(sources_map.keys())
+        kws = args.agg_filter if args.agg_filter else []
+        country_filters = args.agg_country if getattr(args, "agg_country", None) else GLOBAL_CFG.get("agg_countries", [])
+        if isinstance(country_filters, str):
+            country_filters = country_filters.split()
+        country_filters = [str(item).strip() for item in (country_filters or []) if str(item).strip()]
+        if country_filters:
+            safe_print(f"[dim]>> Agg country filter: {' '.join(country_filters)}[/]")
+        try:
+            agg_links = aggregator.get_aggregated_links(
+                sources_map,
+                cats,
+                kws,
+                country_filters=country_filters,
+                log_func=safe_print,
+                console=console
+            )
+            _merge_proxy_entries(lines, agg_links)
+        except: pass
+
+    if hasattr(args, 'direct_list') and args.direct_list:
+        parsed_agg, _ = parse_content("\n".join(args.direct_list))
+        _merge_proxy_entries(lines, parsed_agg)
+
+    if args.reuse and os.path.exists(args.output):
+        with open(args.output, 'r', encoding='utf-8') as f:
+            parsed, count = parse_content(f.read())
+            _merge_proxy_entries(lines, parsed)
+
+    return list(lines.values())
+
+
+def run_tcp_ping_stage(proxy_list, tcp_opts, task_desc="TCP ping prefilter..."):
+    """Run the prefilter and report what it dropped. Returns the surviving list."""
+    threshold = (
+        f", порог RTT <= {tcp_opts['max_latency_ms']} ms"
+        if tcp_opts["max_latency_ms"] else ""
+    )
+    safe_print(
+        f"[cyan]>> TCP ping отсев: {len(proxy_list)} прокси "
+        f"(timeout {tcp_opts['timeout']}s, одновременно {tcp_opts['concurrency']}, "
+        f"ретраев {tcp_opts['retries']}{threshold})[/]"
+    )
+    kept, stats = tcp_ping_filter(proxy_list, tcp_opts, task_desc=task_desc)
+    safe_print(f"[green]>> TCP ping: {format_tcp_ping_summary(stats)}[/]")
+    if stats["skipped_udp"]:
+        safe_print("[dim]>> UDP/QUIC-прокси (hysteria/tuic/wireguard) пропущены мимо TCP-отсева[/]")
+    if tcp_opts["report_file"] and stats["alive"]:
+        safe_print(f"[dim]>> Живые ip:port записаны в {tcp_opts['report_file']}[/]")
+    return kept
+
+
+def run_tcp_ping_only_logic(args):
+    """Standalone prefilter: keep TCP-alive links, write them out, no core involved."""
+    proxies = collect_input_proxies(args)
+    if args.shuffle:
+        random.shuffle(proxies)
+    safe_print(f"[dim]>> Уникальных прокси на входе: {len(proxies)}[/]")
+    if not proxies:
+        safe_print(f"[bold red]Нет прокси для проверки.[/]")
+        return
+
+    tcp_opts = build_tcp_ping_options(args)
+    tcp_opts["enabled"] = True
+    kept = run_tcp_ping_stage(proxies, tcp_opts, task_desc="TCP ping...")
+
+    with open(args.output, 'w', encoding='utf-8') as f:
+        for proxy in kept:
+            value = ({k: v for k, v in proxy.items() if k != "_native_mihomo"}
+                     if isinstance(proxy, dict) else proxy)
+            f.write((json.dumps(value, ensure_ascii=False) if isinstance(value, dict) else value) + '\n')
+
+    safe_print(f"\n[bold green]Готово! Сохранено: {len(kept)}. Результат в: {args.output}[/]")
+
+
 def run_logic(args):
     global CORE_PATH, CORE_FLAVOR, CTRL_C
 
@@ -3410,7 +3849,11 @@ def run_logic(args):
     if getattr(args, "mtproto", False):
         run_mtproto_logic(args)
         return
-    
+
+    if getattr(args, "tcp_ping_only", False):
+        run_tcp_ping_only_logic(args)
+        return
+
     def signal_handler(sig, frame):
         global CTRL_C
         CTRL_C = True
@@ -3532,77 +3975,20 @@ def run_logic(args):
             safe_print(f"[dim]>> Пропущено чужих процессов: {skipped_foreign}[/]")
     time.sleep(0.5)
     
-    lines = {}
-    total_found_raw = 0
-    
-    if args.file:
-        fpath = args.file.strip('"')
-        if os.path.exists(fpath):
-            safe_print(f"[cyan]>> Чтение файла: {fpath}[/]")
-            with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
-                file_payload = f.read()
-                parsed, count = parse_content(file_payload)
-                total_found_raw += count
-                _merge_proxy_entries(lines, parsed)
-                safe_print(f"[dim]>> Прямых ссылок в файле: {len(parsed)}[/]")
-
-                sub_urls = extract_subscription_urls(file_payload)
-                if sub_urls:
-                    safe_print(f"[cyan]>> Найдено URL-подписок в файле: {len(sub_urls)}[/]")
-                    before_sub_merge = len(lines)
-                    fetched_sub_total = 0
-                    for sub_url in sub_urls:
-                        links = fetch_url(sub_url)
-                        fetched_sub_total += len(links)
-                        _merge_proxy_entries(lines, links)
-                    added_unique = len(lines) - before_sub_merge
-                    safe_print(
-                        f"[dim]>> Из подписок получено: {fetched_sub_total}, "
-                        f"добавлено уникальных: {added_unique}[/]"
-                    )
-
-    if args.url:
-        links = fetch_url(args.url)
-        _merge_proxy_entries(lines, links)
-
-    if AGGREGATOR_AVAILABLE and getattr(args, 'agg', False):
-        sources_map = GLOBAL_CFG.get("sources", {})
-        cats = args.agg_cats if args.agg_cats else list(sources_map.keys())
-        kws = args.agg_filter if args.agg_filter else []
-        country_filters = args.agg_country if getattr(args, "agg_country", None) else GLOBAL_CFG.get("agg_countries", [])
-        if isinstance(country_filters, str):
-            country_filters = country_filters.split()
-        country_filters = [str(item).strip() for item in (country_filters or []) if str(item).strip()]
-        if country_filters:
-            safe_print(f"[dim]>> Agg country filter: {' '.join(country_filters)}[/]")
-        try:
-            agg_links = aggregator.get_aggregated_links(
-                sources_map,
-                cats,
-                kws,
-                country_filters=country_filters,
-                log_func=safe_print,
-                console=console
-            )
-            _merge_proxy_entries(lines, agg_links)
-        except: pass
-
-    if hasattr(args, 'direct_list') and args.direct_list:
-        parsed_agg, _ = parse_content("\n".join(args.direct_list))
-        _merge_proxy_entries(lines, parsed_agg)
-
-    if args.reuse and os.path.exists(args.output):
-        with open(args.output, 'r', encoding='utf-8') as f:
-            parsed, count = parse_content(f.read())
-            _merge_proxy_entries(lines, parsed)
-
-    full = list(lines.values())
+    full = collect_input_proxies(args)
     if args.shuffle:
         random.shuffle(full)
     safe_print(f"[dim]>> Уникальных прокси к проверке: {len(full)}[/]")
     if not full:
         safe_print(f"[bold red]Нет прокси для проверки.[/]")
         return
+
+    tcp_opts = build_tcp_ping_options(args)
+    if tcp_opts["enabled"]:
+        full = run_tcp_ping_stage(full, tcp_opts)
+        if not full:
+            safe_print(f"[bold red]После TCP ping отсева не осталось прокси.[/]")
+            return
 
     xray_list = []
     mihomo_list = []
@@ -3657,15 +4043,7 @@ def run_logic(args):
     }
     speed_semaphore = Semaphore(GLOBAL_CFG.get("speed_check_threads", 3))
 
-    progress_columns = [
-        SpinnerColumn(style="bold yellow"),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(bar_width=40, style="dim", complete_style="green", finished_style="bold green"),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TimeElapsedColumn(),
-        TextColumn("•"),
-        TimeRemainingColumn(),
-    ]
+    progress_columns = build_progress_columns()
 
     def _process_batch(batch_full, override_flavor, override_core_path, base_threads, task_desc):
         global CORE_FLAVOR, CORE_PATH, CTRL_C
@@ -4048,6 +4426,130 @@ def core_autoupdate_menu():
             continue
 
 
+def _format_tcp_ping_status():
+    tcp_cfg = get_tcp_ping_config(GLOBAL_CFG)
+    if not _bool_value(tcp_cfg.get("enabled", True), True):
+        return "OFF"
+
+    parts = [
+        f"timeout {tcp_cfg.get('timeout', 3.0)}s",
+        f"одновременно {tcp_cfg.get('concurrency', 500)}",
+        f"ретраев {tcp_cfg.get('retries', 1)}",
+    ]
+    try:
+        max_latency = int(tcp_cfg.get("max_latency_ms", 0) or 0)
+    except (TypeError, ValueError):
+        max_latency = 0
+    if max_latency > 0:
+        parts.append(f"RTT <= {max_latency} ms")
+    return f"ON ({', '.join(parts)})"
+
+
+def _save_tcp_ping(tcp_cfg, message):
+    GLOBAL_CFG["tcp_ping"] = tcp_cfg
+    ok, err = save_main_config(GLOBAL_CFG)
+    if ok:
+        safe_print(f"[green]✓ {message}[/]")
+    else:
+        safe_print(f"[yellow]Не удалось сохранить конфиг: {err}[/]")
+    time.sleep(1.0)
+
+
+def _ask_number(question, current, caster, low, high):
+    """Prompt for a clamped number; returns None when the input is garbage."""
+    raw = Prompt.ask(question, default=str(current))
+    try:
+        return min(max(caster(raw), low), high)
+    except (TypeError, ValueError):
+        safe_print("[yellow]Некорректное значение[/]")
+        time.sleep(1.0)
+        return None
+
+
+def tcp_ping_menu():
+    while True:
+        tcp_cfg = get_tcp_ping_config(GLOBAL_CFG)
+        enabled = _bool_value(tcp_cfg.get("enabled", True), True)
+        skip_udp = _bool_value(tcp_cfg.get("skip_udp", True), True)
+        max_latency = int(tcp_cfg.get("max_latency_ms", 0) or 0)
+        report_file = str(tcp_cfg.get("report_file", "") or "").strip()
+
+        rows = [
+            ("1", "TCP ping отсев", "ON — мёртвые host:port выкидываются до ядра" if enabled else "OFF — все прокси идут в ядро"),
+            ("2", "Таймаут попытки", f"{tcp_cfg.get('timeout', 3.0)} сек"),
+            ("3", "Одновременных коннектов", str(tcp_cfg.get("concurrency", 500))),
+            ("4", "Ретраи", f"{tcp_cfg.get('retries', 1)} (ретраится только timeout)"),
+            ("5", "Порог TCP RTT", "выключен (только живой/мёртвый)" if max_latency <= 0 else f"{max_latency} ms"),
+            ("6", "UDP-протоколы", "пропускать мимо отсева" if skip_udp else "проверять TCP-коннектом"),
+            ("7", "Файл отчёта", report_file or "не писать"),
+            ("0", "Назад", "Вернуться в настройки"),
+        ]
+
+        action = _render_interactive_menu(
+            "TCP ping отсев",
+            rows,
+            subtitle="Быстрый TCP-коннект до host:port перед запуском ядра. Идея: Telegram @loliconshik"
+        )
+
+        if action == "0":
+            return
+
+        if action == "1":
+            tcp_cfg["enabled"] = not enabled
+            _save_tcp_ping(tcp_cfg, f"TCP ping отсев: {'ON' if tcp_cfg['enabled'] else 'OFF'}")
+            continue
+
+        if action == "2":
+            value = _ask_number("Таймаут одной TCP-попытки (сек)", tcp_cfg.get("timeout", 3.0), float, 0.1, 60.0)
+            if value is None:
+                continue
+            tcp_cfg["timeout"] = value
+            _save_tcp_ping(tcp_cfg, f"Таймаут TCP-попытки: {value} сек")
+            continue
+
+        if action == "3":
+            value = _ask_number("Одновременных TCP-коннектов", tcp_cfg.get("concurrency", 500), int, 1, 5000)
+            if value is None:
+                continue
+            tcp_cfg["concurrency"] = value
+            _save_tcp_ping(tcp_cfg, f"Одновременных коннектов: {value}")
+            continue
+
+        if action == "4":
+            value = _ask_number("Доп. попытки перед вердиктом 'мёртв'", tcp_cfg.get("retries", 1), int, 0, 5)
+            if value is None:
+                continue
+            tcp_cfg["retries"] = value
+            _save_tcp_ping(tcp_cfg, f"Ретраи TCP-коннекта: {value}")
+            continue
+
+        if action == "5":
+            value = _ask_number("Порог TCP RTT (мс), 0 = выключить", max_latency, int, 0, 60000)
+            if value is None:
+                continue
+            tcp_cfg["max_latency_ms"] = value
+            _save_tcp_ping(tcp_cfg, f"Порог TCP RTT: {'выключен' if value <= 0 else f'{value} ms'}")
+            continue
+
+        if action == "6":
+            tcp_cfg["skip_udp"] = not skip_udp
+            _save_tcp_ping(
+                tcp_cfg,
+                "UDP-протоколы пропускаются мимо отсева" if tcp_cfg["skip_udp"]
+                else "UDP-протоколы проверяются TCP-коннектом (возможны ложные отсевы)"
+            )
+            continue
+
+        if action == "7":
+            raw = Prompt.ask("Файл со списком живых ip:port (пусто = не писать)", default=report_file)
+            tcp_cfg["report_file"] = str(raw or "").strip()
+            _save_tcp_ping(
+                tcp_cfg,
+                f"Файл отчёта: {tcp_cfg['report_file'] or 'не писать'}"
+            )
+            continue
+
+
 def _render_interactive_status(mt_cfg):
     router_state = "ON" if _bool_value(GLOBAL_CFG.get("router_mode", False), False) else "OFF"
     cleanup_state = normalize_cleanup_mode(GLOBAL_CFG.get("core_cleanup_mode", "owned"))
@@ -4062,6 +4564,7 @@ def _render_interactive_status(mt_cfg):
         f"Xray/Mihomo: {GLOBAL_CFG.get('max_ping_ms', 500)} ms | "
         f"MTProto: {mt_cfg.get('max_ping_ms', 0)} ms"
     )
+    status_grid.add_row("TCP ping отсев", _format_tcp_ping_status())
     status_grid.add_row("Router/Cleanup", f"{router_state} / {cleanup_state}")
     status_grid.add_row("Автообновление ядер", _format_core_autoupdate_status())
     status_grid.add_row(
@@ -4131,11 +4634,21 @@ def _build_interactive_defaults():
         "menu": True,
         "mtproto": False,
         "mtproto_login": False,
+        # None = взять значение из config.json (блок tcp_ping)
+        "tcp_ping": None,
+        "tcp_ping_only": False,
+        "tcp_ping_timeout": None,
+        "tcp_ping_concurrency": None,
+        "tcp_ping_retries": None,
+        "tcp_ping_max_ms": None,
     }
 
 
 def _run_interactive_args(defaults):
-    if not defaults.get("mtproto") and Confirm.ask("Включить тест скорости?", default=False):
+    if defaults.get("tcp_ping_only"):
+        defaults["speed_check"] = False
+        defaults["sort_by"] = "ping"
+    elif not defaults.get("mtproto") and Confirm.ask("Включить тест скорости?", default=False):
         defaults["speed_check"] = True
         defaults["sort_by"] = "speed"
     else:
@@ -4189,6 +4702,7 @@ def interactive_menu():
             ]
             if AGGREGATOR_AVAILABLE:
                 check_rows.insert(6, ("7", "Агрегатор", "Скачать базы, объединить и проверить"))
+            check_rows.insert(len(check_rows) - 1, ("8", "TCP ping отсев", "Только TCP-отсев файла/ссылки, ядро не запускается"))
 
             action = _render_interactive_menu("Проверка", check_rows)
             if action == "0":
@@ -4257,6 +4771,19 @@ def interactive_menu():
                 except Exception as e:
                     safe_print(f"[bold red]Ошибка агрегатора: {e}[/]")
                     continue
+            elif action == "8":
+                defaults["tcp_ping_only"] = True
+                source = Prompt.ask("[cyan][?][/] Путь к файлу или URL подписки").strip('"').strip()
+                if not source:
+                    continue
+                if source.lower().startswith(("http://", "https://")):
+                    defaults["url"] = source
+                else:
+                    defaults["file"] = source
+                defaults["output"] = Prompt.ask(
+                    "[cyan][?][/] Куда сохранить живые ссылки",
+                    default="tcp_alive.txt"
+                ).strip('"')
 
             _run_interactive_args(defaults)
             continue
@@ -4271,6 +4798,7 @@ def interactive_menu():
                 ("6", "CONN MTProto", "save" if _bool_value(mt_cfg.get("save_connect_only", True), True) else "off"),
                 ("7", "Login MTProto", "Авторизовать session для Promo"),
                 ("8", "Ядра: автообновление", _format_core_autoupdate_status()),
+                ("9", "TCP ping отсев", _format_tcp_ping_status()),
                 ("0", "Назад", "Вернуться в главное меню"),
             ]
             action = _render_interactive_menu("Настройки", settings_rows)
@@ -4426,6 +4954,10 @@ def interactive_menu():
                 core_autoupdate_menu()
                 continue
 
+            if action == "9":
+                tcp_ping_menu()
+                continue
+
         if main_choice == "3":
             service_rows = [
                 ("1", "Сброс ядер", "Убить все процессы xray/mihomo"),
@@ -4492,6 +5024,13 @@ def main():
     parser.add_argument("-o", "--output", default=GLOBAL_CFG['output_file'])
     parser.add_argument("-d", "--domain", default=GLOBAL_CFG['test_domain'])
     parser.add_argument("--max-ping", type=int, default=GLOBAL_CFG.get("max_ping_ms", 500), dest="max_ping", help="Отсев по ping (мс). 0 = отключить")
+    parser.add_argument("--tcp-ping", dest="tcp_ping", action="store_true", default=None, help="Включить TCP ping отсев перед проверкой ядром")
+    parser.add_argument("--no-tcp-ping", dest="tcp_ping", action="store_false", help="Отключить TCP ping отсев")
+    parser.add_argument("--tcp-ping-only", dest="tcp_ping_only", action="store_true", help="Только TCP ping отсев: сохранить живые ссылки и выйти (ядро не запускается)")
+    parser.add_argument("--tcp-ping-timeout", dest="tcp_ping_timeout", type=float, default=None, help="Таймаут одной TCP-попытки в отсеве (сек)")
+    parser.add_argument("--tcp-ping-concurrency", dest="tcp_ping_concurrency", type=int, default=None, help="Сколько TCP-коннектов держать одновременно в отсеве")
+    parser.add_argument("--tcp-ping-retries", dest="tcp_ping_retries", type=int, default=None, help="Доп. попытки TCP-коннекта перед вердиктом 'мёртв'")
+    parser.add_argument("--tcp-ping-max-ms", dest="tcp_ping_max_ms", type=int, default=None, help="Порог TCP RTT (мс) в отсеве. 0 = только живой/мёртвый")
     parser.add_argument("-s", "--shuffle", action='store_true', default=GLOBAL_CFG['shuffle'])
     parser.add_argument("-n", "--number", type=int)
     parser.add_argument("--agg", action="store_true", help="Запустить агрегатор")
@@ -4535,7 +5074,8 @@ def main():
             safe_print("[yellow][DEBUG MODE] proxies_per_batch=1, threads=1[/]")
 
         args = apply_mtproto_arg_defaults(args)
-        
+        args = apply_tcp_ping_arg_defaults(args)
+
         if args.menu: interactive_menu()
         else:
             print(Fore.CYAN + "MK_XRAYchecker by mkultra69 with HATE" + Style.RESET_ALL)
