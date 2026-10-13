@@ -2113,7 +2113,12 @@ def get_mihomo_proxy_structure(proxy_url, name):
         "udp": False
     }
 
-    security = (proxy_conf.get("security") or "none").lower()
+    security = proxy_conf.get("security")
+    if isinstance(security, str):
+        security = security.lower()
+    else:
+        security = "none"
+
     sni = proxy_conf.get("sni") or proxy_conf.get("host") or ""
 
     if proto in ("ss", "shadowsocks"):
