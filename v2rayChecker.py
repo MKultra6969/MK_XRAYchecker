@@ -1553,6 +1553,26 @@ def parse_vless(url):
             "ech": _uri_value(params, "ech"), "fm": fm, "extra": extra, "vcn": _uri_value(params, "vcn"),
             "tag": urllib.parse.unquote(parsed.fragment).strip(), "diagnostics": [f"unknown query: {key}" for key in unknown]
         }
+
+def _vmess_json_tls(value):
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in ("tls", "xtls"):
+            return "tls"
+        if low == "reality":
+            return "reality"
+    return "tls" if _bool_value(value, False) else "none"
+
+def _vmess_text(value):
+    if isinstance(value, bool) or not value:
+        return ""
+    return _first_scalar(value)
+
+def _vmess_alpn(value):
+    if isinstance(value, list):
+        return ",".join(str(item) for item in value if item not in (None, ""))
+    return _vmess_text(value)
+
 def parse_vmess(url):
     try:
         url = html.unescape(str(url).strip().replace("\ufeff", "").replace("\u200b", "").replace("\n", "").replace("\r", ""))
@@ -1629,16 +1649,16 @@ def parse_vmess(url):
                 "aid": int(data.get("aid", 0)),
                 "type": net_type,
                 "raw_type": raw_net_type,
-                "security": data.get("tls", "") if data.get("tls") else "none",
-                "path": data.get("path", ""),
-                "host": data.get("host", ""),
-                "sni": data.get("sni", ""),
-                "fp": data.get("fp", ""),
-                "alpn": data.get("alpn", ""),
+                "security": _vmess_json_tls(data.get("tls", "")),
+                "path": _vmess_text(data.get("path", "")),
+                "host": _vmess_text(data.get("host", "")),
+                "sni": _vmess_text(data.get("sni", "")),
+                "fp": _vmess_text(data.get("fp", "")),
+                "alpn": _vmess_alpn(data.get("alpn", "")),
                 "scy": cipher,
-                "ech": data.get("ech", ""),
+                "ech": _vmess_text(data.get("ech", "")),
                 "ed": str(data.get("ed", "")),
-                "tag": data.get("ps", tag)
+                "tag": _vmess_text(data.get("ps", tag))
             }
         except:
             pass
@@ -2066,7 +2086,11 @@ def protocol_capability(proxy_url):
     if proto in ("vless", "vmess", "trojan", "shadowsocks"):
         if get_outbound_structure(proxy_url, "probe"):
             return "xray"
-        return "mihomo" if get_mihomo_proxy_structure(proxy_url, "probe") else "unsupported"
+        try:
+            mihomo_ok = get_mihomo_proxy_structure(proxy_url, "probe")
+        except Exception:
+            return "unsupported"
+        return "mihomo" if mihomo_ok else "unsupported"
     return "unsupported"
 
 def mihomo_supports_shadowquic(core_path):
