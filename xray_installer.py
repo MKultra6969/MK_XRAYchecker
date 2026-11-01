@@ -756,18 +756,14 @@ def download_and_install_xray(release_info, cfg):
             for name in zf.namelist():
                 basename = os.path.basename(name)
                 if basename in xray_names:
-                    zf.extract(name, install_path)
-                    extracted_binary = os.path.join(install_path, name)
-                    
+                    # Write member bytes to the fixed destination instead
+                    # of extracting by member name, so a member path like
+                    # ../../xray cannot escape the install directory.
                     final_name = 'xray.exe' if os_name == 'windows' else 'xray'
                     final_path = os.path.join(install_path, final_name)
-                    
-                    if extracted_binary != final_path:
-                        if os.path.exists(final_path):
-                            os.remove(final_path)
-                        shutil.move(extracted_binary, final_path)
-                        extracted_binary = final_path
-                    
+                    with open(final_path, 'wb') as out:
+                        out.write(zf.read(name))
+                    extracted_binary = final_path
                     break
             
             if not extracted_binary or not os.path.exists(extracted_binary):
@@ -780,10 +776,8 @@ def download_and_install_xray(release_info, cfg):
                 if basename in geo_files:
                     dest_path = os.path.join(script_dir, basename)
                     if not os.path.exists(dest_path):
-                        zf.extract(name, script_dir)
-                        extracted = os.path.join(script_dir, name)
-                        if extracted != dest_path and os.path.exists(extracted):
-                            shutil.move(extracted, dest_path)
+                        with open(dest_path, 'wb') as out:
+                            out.write(zf.read(name))
     
     except zipfile.BadZipFile:
         _safe_print("[red]Скачанный файл не является валидным ZIP архивом[/]")
